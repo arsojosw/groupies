@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { PointerEvent } from "react";
+import type { ChangeEvent, PointerEvent } from "react";
 import DiceBox from "@3d-dice/dice-box-threejs";
 import ChatPanel from "./ChatPanel";
+import { prepareMap, prepareToken, upload } from "./imageUtils";
 import { signOut, socket } from "./socket";
 import { panel, row } from "./styles";
-import type { Init, Invite, Member, Msg, Token } from "./types";
+import type { Init, Invite, MapInfo, Member, Msg, Token } from "./types";
 
 type DiceBoxLike = {
   roll: (notation: string) => Promise<unknown>;
@@ -16,6 +17,7 @@ type TokenPatch = {
 };
 type View = { x: number; y: number; z: number }; // pan in screen px, zoom factor
 type Pt = { x: number; y: number };
+type Dims = { w: number; h: number };
 type Gesture =
   | { kind: "pan"; sx: number; sy: number; vx: number; vy: number }
   | { kind: "token"; id: string; dx: number; dy: number }
@@ -23,13 +25,12 @@ type Gesture =
   | null;
 
 const CELL = 40;
-const MAP_W = 2000; // keep in sync with the server
-const MAP_H = 2000;
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 4;
 const EDGE = 60; // how far past the map edge you can pan
 const DICE_KEY = "vtt:dice3d";
 const SNAP_KEY = "vtt:snap";
+const GRID_KEY = "vtt:grid";
 const SIZES = [1, 2, 3, 4, 5];
 const D3_SIDES = [4, 6, 8, 10, 12, 20];
 const MAX_3D_DICE = 8;
@@ -43,30 +44,47 @@ function loadFlag(key: string, fallback: boolean): boolean {
   }
 }
 
-const clampZoom = (z: number) => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z));
+const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
+const clampZoom = (z: number) => clamp(z, MIN_ZOOM, MAX_ZOOM);
 
-const clampPos = (size: number, x: number, y: number): Pt => ({
-  x: Math.max(0, Math.min(MAP_W - size * CELL, x)),
-  y: Math.max(0, Math.min(MAP_H - size * CELL, y)),
+const clampPos = (d: Dims, size: number, x: number, y: number): Pt => ({
+  x: clamp(x, 0, d.w - size * CELL),
+  y: clamp(y, 0, d.h - size * CELL),
 });
 
-const snapPos = (size: number, x: number, y: number): Pt =>
-  clampPos(size, Math.round(x / CELL) * CELL, Math.round(y / CELL) * CELL);
+const snapPos = (d: Dims, size: number, x: number, y: number): Pt =>
+  clampPos(d, size, Math.round(x / CELL) * CELL, Math.round(y / CELL) * CELL);
 
 // Keeps the map from being dragged out of sight; centers it when zoomed far out
-function constrain(v: View, w: number, h: number): View {
+function constrain(v: View, w: number, h: number, d: Dims): View {
   const fix = (pos: number, mapSize: number, viewSize: number) => {
     const s = mapSize * v.z;
     if (s <= viewSize) return (viewSize - s) / 2;
     return Math.min(EDGE, Math.max(viewSize - s - EDGE, pos));
   };
-  return { x: fix(v.x, MAP_W, w), y: fix(v.y, MAP_H, h), z: v.z };
+  return { x: fix(v.x, d.w, w), y: fix(v.y, d.h, h), z: v.z };
+}
+
+// Map size for a number of squares across, keeping the picture's shape
+function sizeFor(squares: number, aspect: number): Dims {
+  let w = clamp(Math.round(squares) || 50, 10, 100) * CELL;
+  let h = Math.round(w * aspect);
+  if (h > 4000) {
+    h = 4000;
+    w = Math.round(h / aspect);
+  }
+  if (h < 400) {
+    h = 400;
+    w = Math.round(h / aspect);
+  }
+  return { w, h };
 }
 
 export default function Game({ init }: { init: Init }) {
   const { me } = init;
   const isGm = me.role === "gm";
   const [tokens, setTokens] = useState<Record<string, Token>>(init.tokens);
+  const [map, setMap] = useState<MapInfo>(init.map);
   const [members, setMembers] = useState<Member[]>(init.members);
   const [messages, setMessages] = useState<Msg[]>(init.messages);
   const [invites, setInvites] = useState<Invite[]>(init.invites ?? []);
@@ -78,13 +96,22 @@ export default function Game({ init }: { init: Init }) {
   const [inviteHours, setInviteHours] = useState(24);
   const [inviteUses, setInviteUses] = useState(6);
   const [inviteError, setInviteError] = useState("");
+  const [squaresDraft, setSquaresDraft] = useState<string | null>(null);
+  const [busy, setBusy] = useState("");
+  const [uploadError, setUploadError] = useState("");
   const [dice3d, setDice3d] = useState(() => loadFlag(DICE_KEY, true));
   const [snap, setSnap] = useState(() => loadFlag(SNAP_KEY, true));
+  const [showGrid, setShowGrid] = useState(() => loadFlag(GRID_KEY, true));
 
   const viewportRef = useRef<HTMLDivElement>(null);
   const layerRef = useRef<HTMLDivElement>(null);
   const zoomRef = useRef<HTMLSpanElement>(null);
+  const mapFileRef = useRef<HTMLInputElement>(null);
+  const tokenFileRef = useRef<HTMLInputElement>(null);
+  const tokenUploadId = useRef<string | null>(null);
   const view = useRef<View>({ x: 20, y: 20, z: 1 });
+  const dims = useRef<Dims>({ w: init.map.w, h: init.map.h });
+  const lastImage = useRef(init.map.image);
   const pointers = useRef(new Map<number, Pt>());
   const gesture = useRef<Gesture>(null);
   const dragPos = useRef<Pt | null>(null);
@@ -103,7 +130,7 @@ export default function Game({ init }: { init: Init }) {
   // The transform is written straight to the DOM so panning stays smooth
   const applyView = useCallback((next: View) => {
     const vp = viewportRef.current;
-    const v = vp ? constrain(next, vp.clientWidth, vp.clientHeight) : next;
+    const v = vp ? constrain(next, vp.clientWidth, vp.clientHeight, dims.current) : next;
     view.current = v;
     if (layerRef.current) layerRef.current.style.transform = `translate(${v.x}px, ${v.y}px) scale(${v.z})`;
     if (zoomRef.current) zoomRef.current.textContent = `${Math.round(v.z * 100)}%`;
@@ -125,6 +152,16 @@ export default function Game({ init }: { init: Init }) {
     const vp = viewportRef.current;
     return { w: vp?.clientWidth ?? 600, h: vp?.clientHeight ?? 400 };
   };
+
+  const fitMap = useCallback(() => {
+    const vp = viewportRef.current;
+    const w = vp?.clientWidth ?? 600;
+    const h = vp?.clientHeight ?? 400;
+    const d = dims.current;
+    const z = clampZoom(Math.min(w / d.w, h / d.h));
+    applyView({ x: (w - d.w * z) / 2, y: (h - d.h * z) / 2, z });
+  }, [applyView]);
+
   const zoomBy = (f: number) => {
     const { w, h } = vpSize();
     zoomAt(w / 2, h / 2, view.current.z * f);
@@ -132,11 +169,6 @@ export default function Game({ init }: { init: Init }) {
   const resetZoom = () => {
     const { w, h } = vpSize();
     zoomAt(w / 2, h / 2, 1);
-  };
-  const fitMap = () => {
-    const { w, h } = vpSize();
-    const z = clampZoom(Math.min(w / MAP_W, h / MAP_H));
-    applyView({ x: (w - MAP_W * z) / 2, y: (h - MAP_H * z) / 2, z });
   };
   const centerOn = (t: Token) => {
     const { w, h } = vpSize();
@@ -146,7 +178,7 @@ export default function Game({ init }: { init: Init }) {
     applyView({ x: w / 2 - cx * z, y: h / 2 - cy * z, z });
   };
 
-  // Starting view: centered on your own token, otherwise the top-left of the map
+  // Starting view: your own token, else the whole map if it has a picture, else the top-left
   useEffect(() => {
     const vp = viewportRef.current;
     const own = Object.values(init.tokens).find((t) => t.ownerId === init.me.id);
@@ -154,10 +186,12 @@ export default function Game({ init }: { init: Init }) {
       const cx = own.x + (own.size * CELL) / 2;
       const cy = own.y + (own.size * CELL) / 2;
       applyView({ x: vp.clientWidth / 2 - cx, y: vp.clientHeight / 2 - cy, z: 1 });
+    } else if (init.map.image) {
+      fitMap();
     } else {
       applyView({ x: 20, y: 20, z: 1 });
     }
-  }, [applyView, init]);
+  }, [applyView, fitMap, init]);
 
   // Mouse wheel / trackpad pinch zoom (needs a non-passive listener to stop page scrolling)
   useEffect(() => {
@@ -186,10 +220,11 @@ export default function Game({ init }: { init: Init }) {
   useEffect(() => {
     try {
       localStorage.setItem(SNAP_KEY, snap ? "on" : "off");
+      localStorage.setItem(GRID_KEY, showGrid ? "on" : "off");
     } catch {
       /* ignore */
     }
-  }, [snap]);
+  }, [snap, showGrid]);
 
   // ---------- 3D dice layer ----------
   useEffect(() => {
@@ -215,6 +250,16 @@ export default function Game({ init }: { init: Init }) {
   useEffect(() => {
     socket.on("members", setMembers);
     socket.on("invites", setInvites);
+    socket.on("map", (m: MapInfo) => {
+      dims.current = { w: m.w, h: m.h };
+      setMap(m);
+      if (m.image !== lastImage.current) {
+        lastImage.current = m.image;
+        fitMap(); // a new picture: show the whole map
+      } else {
+        applyView(view.current); // just resized: keep the current zoom
+      }
+    });
     const upsert = (t: Token) => setTokens((all) => ({ ...all, [t.id]: t }));
     socket.on("tokenAdded", upsert);
     socket.on("tokenUpdated", upsert);
@@ -250,13 +295,14 @@ export default function Game({ init }: { init: Init }) {
     return () => {
       socket.off("members");
       socket.off("invites");
+      socket.off("map");
       socket.off("tokenAdded");
       socket.off("tokenUpdated");
       socket.off("tokenRemoved");
       socket.off("moved");
       socket.off("chat");
     };
-  }, []);
+  }, [applyView, fitMap]);
 
   // ---------- pointer handling: drag token, pan, pinch ----------
   const canMove = (t: Token) => isGm || t.ownerId === me.id;
@@ -293,7 +339,7 @@ export default function Game({ init }: { init: Init }) {
     const t = tokens[g.id];
     const last = dragPos.current;
     if (!t || !last) return;
-    const end = snap ? snapPos(t.size, last.x, last.y) : last;
+    const end = snap ? snapPos(dims.current, t.size, last.x, last.y) : last;
     setTokens((all) => (all[g.id] ? { ...all, [g.id]: { ...all[g.id], x: end.x, y: end.y } } : all));
     socket.emit("move", { id: g.id, x: end.x, y: end.y });
   };
@@ -341,7 +387,7 @@ export default function Game({ init }: { init: Init }) {
       const t = tokens[g.id];
       if (!t) return;
       const m = toMap(p);
-      const pos = clampPos(t.size, m.x - g.dx, m.y - g.dy);
+      const pos = clampPos(dims.current, t.size, m.x - g.dx, m.y - g.dy);
       dragPos.current = pos;
       setTokens((all) => (all[g.id] ? { ...all, [g.id]: { ...all[g.id], x: pos.x, y: pos.y } } : all));
       const now = Date.now();
@@ -366,7 +412,7 @@ export default function Game({ init }: { init: Init }) {
     if (pointers.current.size === 0) gesture.current = null;
   };
 
-  // ---------- token and invite actions ----------
+  // ---------- token, map and invite actions ----------
   const update = (id: string, patch: TokenPatch) => {
     setTokens((all) => ({ ...all, [id]: { ...all[id], ...patch } }));
     socket.emit("updateToken", { id, ...patch });
@@ -383,12 +429,54 @@ export default function Game({ init }: { init: Init }) {
     const v = view.current;
     const cx = (w / 2 - v.x) / v.z;
     const cy = (h / 2 - v.y) / v.z;
-    const s = snapPos(newSize, cx - (newSize * CELL) / 2, cy - (newSize * CELL) / 2);
+    const s = snapPos(dims.current, newSize, cx - (newSize * CELL) / 2, cy - (newSize * CELL) / 2);
     socket.emit("addToken", {
       label: newLabel, color: newColor, size: newSize, ownerId: newOwner || null,
       hp: newHp, maxHp: newHp, x: s.x, y: s.y,
     });
     setNewLabel("");
+  };
+
+  const applySquares = () => {
+    const n = Number(squaresDraft ?? Math.round(map.w / CELL));
+    socket.emit("setMap", sizeFor(n, map.h / map.w));
+    setSquaresDraft(null);
+  };
+
+  const onMapFile = async (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setBusy("Uploading map...");
+    setUploadError("");
+    try {
+      const p = await prepareMap(file);
+      // Guess the grid: most battle maps use about 70 px per square
+      const size = sizeFor(Math.round(p.width / 70), p.height / p.width);
+      const err = await upload("map", p.blob, size);
+      if (err) setUploadError(err);
+      else setSquaresDraft(null);
+    } catch (err) {
+      setUploadError(err instanceof Error ? err.message : "Upload failed");
+    }
+    setBusy("");
+  };
+
+  const onTokenFile = async (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    const id = tokenUploadId.current;
+    if (!file || !id) return;
+    setBusy("Uploading token image...");
+    setUploadError("");
+    try {
+      const blob = await prepareToken(file);
+      const err = await upload("token", blob, { tokenId: id });
+      if (err) setUploadError(err);
+    } catch (err) {
+      setUploadError(err instanceof Error ? err.message : "Upload failed");
+    }
+    setBusy("");
   };
 
   const createInvite = () =>
@@ -402,6 +490,17 @@ export default function Game({ init }: { init: Init }) {
   };
 
   const inviteLink = (code: string) => `${window.location.origin}/?join=${code}`;
+
+  // Grid lines: a dark and a light line together so they show on any picture
+  const gridImage = map.image
+    ? "linear-gradient(rgba(0,0,0,.35) 1px, rgba(255,255,255,.3) 1px 2px, transparent 2px), linear-gradient(90deg, rgba(0,0,0,.35) 1px, rgba(255,255,255,.3) 1px 2px, transparent 2px)"
+    : "linear-gradient(#0002 1px, transparent 1px), linear-gradient(90deg, #0002 1px, transparent 1px)";
+
+  const status = busy ? (
+    <div style={{ fontSize: 13, color: "#555", marginTop: 6 }}>{busy}</div>
+  ) : uploadError ? (
+    <div style={{ fontSize: 13, color: "#c0392b", marginTop: 6 }}>{uploadError}</div>
+  ) : null;
 
   return (
     <div style={{ padding: 20, fontFamily: "sans-serif", maxWidth: 1280, margin: "0 auto" }}>
@@ -428,6 +527,9 @@ export default function Game({ init }: { init: Init }) {
             <label style={{ fontSize: 13, marginLeft: 8 }}>
               <input type="checkbox" checked={snap} onChange={(e) => setSnap(e.target.checked)} /> Snap to grid
             </label>
+            <label style={{ fontSize: 13 }}>
+              <input type="checkbox" checked={showGrid} onChange={(e) => setShowGrid(e.target.checked)} /> Show grid
+            </label>
           </div>
 
           <div
@@ -446,13 +548,19 @@ export default function Game({ init }: { init: Init }) {
             <div
               ref={layerRef}
               style={{
-                position: "absolute", left: 0, top: 0, width: MAP_W, height: MAP_H,
-                transformOrigin: "0 0", willChange: "transform", background: "#e8e0cc",
-                backgroundImage:
-                  "linear-gradient(#0002 1px, transparent 1px), linear-gradient(90deg, #0002 1px, transparent 1px)",
-                backgroundSize: `${CELL}px ${CELL}px`, boxShadow: "0 0 0 2px #222",
+                position: "absolute", left: 0, top: 0, width: map.w, height: map.h,
+               transformOrigin: "0 0", boxShadow: "0 0 0 2px #222",
+                background: map.image ? `#bbb url(${map.image}) 0 0 / 100% 100% no-repeat` : "#e8e0cc",
               }}
             >
+              {showGrid && (
+                <div
+                  style={{
+                    position: "absolute", inset: 0, pointerEvents: "none",
+                    backgroundImage: gridImage, backgroundSize: `${CELL}px ${CELL}px`,
+                  }}
+                />
+              )}
               {Object.values(tokens).map((t) => (
                 <div
                   key={t.id}
@@ -465,8 +573,11 @@ export default function Game({ init }: { init: Init }) {
                 >
                   <div
                     style={{
-                      width: "100%", height: "100%", borderRadius: "50%", background: t.color, boxSizing: "border-box",
-                      border: `3px solid ${t.ownerId === null ? "#222" : t.ownerId === me.id ? "#f1c40f" : "#fff"}`,
+                      width: "100%", height: "100%", borderRadius: "50%", boxSizing: "border-box",
+                      background: t.image ? `url(${t.image}) center / cover no-repeat` : t.color,
+                      border: t.image
+                        ? "none"
+                        : `3px solid ${t.ownerId === null ? "#222" : t.ownerId === me.id ? "#f1c40f" : "#fff"}`,
                     }}
                   />
                   <div
@@ -548,6 +659,39 @@ export default function Game({ init }: { init: Init }) {
             </div>
           )}
 
+          {isGm && (
+            <div style={panel}>
+              <b>Map</b>
+              <div style={{ ...row, marginTop: 6 }}>
+                <button disabled={!!busy} onClick={() => mapFileRef.current?.click()}>
+                  {map.image ? "Replace map image" : "Upload map image"}
+                </button>
+                {map.image && <button onClick={() => socket.emit("clearMap")}>Remove image</button>}
+              </div>
+              <div style={{ ...row, marginTop: 6 }}>
+                <label style={{ fontSize: 13 }}>
+                  Squares across{" "}
+                  <input
+                    type="number" min={10} max={100} style={{ width: 60 }}
+                    value={squaresDraft ?? String(Math.round(map.w / CELL))}
+                    onChange={(e) => setSquaresDraft(e.target.value)}
+                  />
+                </label>
+                <button onClick={applySquares}>Apply</button>
+                <span style={{ fontSize: 12, color: "#777" }}>{map.w} × {map.h} px</span>
+              </div>
+              <div style={{ fontSize: 12, color: "#777", marginTop: 6 }}>
+                If the picture's own grid does not line up with the game grid, change "Squares across" and press
+                Apply. PNG, JPG or WebP. Large images are resized for you.
+              </div>
+              {status}
+              <input
+                ref={mapFileRef} type="file" accept="image/png,image/jpeg,image/webp"
+                style={{ display: "none" }} onChange={onMapFile}
+              />
+            </div>
+          )}
+
           <ChatPanel me={me} members={members} messages={messages} dice3d={dice3d} onDice3d={setDice3d} />
 
           <div style={panel}>
@@ -602,6 +746,18 @@ export default function Game({ init }: { init: Init }) {
                       }}
                     />
                   </div>
+                  <div style={{ ...row, marginTop: 6 }}>
+                    <button
+                      disabled={!!busy}
+                      onClick={() => {
+                        tokenUploadId.current = t.id;
+                        tokenFileRef.current?.click();
+                      }}
+                    >
+                      {t.image ? "Change image" : "Add image"}
+                    </button>
+                    {t.image && <button onClick={() => socket.emit("clearTokenImage", t.id)}>Remove image</button>}
+                  </div>
                 </div>
               ) : (
                 <div key={t.id} style={{ ...row, borderTop: "1px solid #eee", marginTop: 8, paddingTop: 8 }}>
@@ -625,6 +781,13 @@ export default function Game({ init }: { init: Init }) {
                   )}
                 </div>
               )
+            )}
+            {isGm && status}
+            {isGm && (
+              <input
+                ref={tokenFileRef} type="file" accept="image/png,image/jpeg,image/webp"
+                style={{ display: "none" }} onChange={onTokenFile}
+              />
             )}
           </div>
 
@@ -662,6 +825,9 @@ export default function Game({ init }: { init: Init }) {
                   />
                 </label>
                 <button onClick={addToken}>Add</button>
+              </div>
+              <div style={{ fontSize: 12, color: "#777", marginTop: 6 }}>
+                Add the token first, then use "Add image" on it in the Tokens list.
               </div>
             </div>
           )}

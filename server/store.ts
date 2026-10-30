@@ -9,7 +9,7 @@ export type Account = {
 };
 export type Token = {
   id: string; x: number; y: number; color: string; label: string;
-  size: number; ownerId: string | null; hp: number; maxHp: number;
+  size: number; ownerId: string | null; hp: number; maxHp: number; image?: string;
 };
 export type Roll = { formula: string; rolls: number[]; sides: number; total: number; keep?: boolean[] };
 export type Msg = {
@@ -17,9 +17,12 @@ export type Msg = {
   to: string[] | null; kind: "text" | "roll"; text?: string; roll?: Roll;
 };
 export type Invite = { code: string; expiresAt: number; maxUses: number; uses: number };
+export type MapInfo = { image?: string; w: number; h: number };
+export type Asset = { file: string; size: number };
 export type Campaign = {
   id: string; name: string; gmId: string; memberIds: string[];
   tokens: Record<string, Token>; messages: Msg[]; invites: Invite[];
+  map: MapInfo; assets: Record<string, Asset>;
 };
 type DB = {
   accounts: Record<string, Account>;
@@ -41,6 +44,10 @@ export async function loadDb() {
   }
   const now = Date.now();
   for (const [k, s] of Object.entries(db.sessions)) if (s.expiresAt < now) delete db.sessions[k];
+   for (const c of Object.values(db.campaigns)) {
+    c.map ??= { w: 2000, h: 2000 };
+    c.assets ??= {};
+  }
 }
 
 let timer: ReturnType<typeof setTimeout> | null = null;
@@ -98,6 +105,7 @@ export async function createGm(username: string, password: string, campaignName:
   db.campaigns[campId] = {
     id: campId, name: campaignName.trim().slice(0, 40) || `${uname}'s table`,
     gmId: accId, memberIds: [], tokens: {}, messages: [], invites: [],
+    map: { w: 2000, h: 2000 }, assets: {},
   };
   save();
   return { account: db.accounts[accId] };

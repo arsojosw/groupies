@@ -6,6 +6,10 @@ export default defineConfig({
   plugins: [react()],
   server: {
     allowedHosts: true,
-    proxy: { "/socket.io": { target: "http://localhost:3001", ws: true } },
+    proxy: {
+      "/socket.io": { target: "http://localhost:3001", ws: true },
+      "/api": "http://localhost:3001",
+      "/uploads": "http://localhost:3001",
+    },
   },
 })
