@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ChangeEvent, PointerEvent } from "react";
+import type { ChangeEvent, CSSProperties, PointerEvent } from "react";
 import DiceBox from "@3d-dice/dice-box-threejs";
 import ChatPanel from "./ChatPanel";
 import { prepareMap, prepareToken, upload } from "./imageUtils";
 import { signOut, socket } from "./socket";
-import { panel, row } from "./styles";
+import { row } from "./styles";
 import type { Init, Invite, MapInfo, Member, Msg, Token } from "./types";
 
 type DiceBoxLike = {
@@ -18,9 +18,10 @@ type TokenPatch = {
 type View = { x: number; y: number; z: number }; // pan in screen px, zoom factor
 type Pt = { x: number; y: number };
 type Dims = { w: number; h: number };
+type Tab = "token" | "chat" | "dice" | "tokens" | "map" | "invite";
 type Gesture =
-  | { kind: "pan"; sx: number; sy: number; vx: number; vy: number }
-  | { kind: "token"; id: string; dx: number; dy: number }
+  | { kind: "pan"; sx: number; sy: number; vx: number; vy: number; moved: boolean }
+  | { kind: "token"; id: string; dx: number; dy: number; sx: number; sy: number; moved: boolean }
   | { kind: "pinch"; dist: number; z: number; mapX: number; mapY: number }
   | null;
 
@@ -28,12 +29,18 @@ const CELL = 40;
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 4;
 const EDGE = 60; // how far past the map edge you can pan
+const TAP_SLOP = 6; // movement (px) under which a press counts as a tap
 const DICE_KEY = "vtt:dice3d";
 const SNAP_KEY = "vtt:snap";
 const GRID_KEY = "vtt:grid";
+const HINT_KEY = "vtt:hint";
 const SIZES = [1, 2, 3, 4, 5];
 const D3_SIDES = [4, 6, 8, 10, 12, 20];
 const MAX_3D_DICE = 8;
+
+const floating: CSSProperties = {
+  background: "#fff", border: "1px solid #bbb", borderRadius: 10, boxShadow: "0 6px 24px #0005",
+};
 
 function loadFlag(key: string, fallback: boolean): boolean {
   try {
@@ -80,9 +87,28 @@ function sizeFor(squares: number, aspect: number): Dims {
   return { w, h };
 }
 
+// True on phone-sized screens
+function useNarrow() {
+  const [narrow, setNarrow] = useState(() => window.matchMedia("(max-width: 700px)").matches);
+  useEffect(() => {
+    const mq = window.matchMedia("(max-width: 700px)");
+    const on = () => setNarrow(mq.matches);
+    mq.addEventListener("change", on);
+    return () => mq.removeEventListener("change", on);
+  }, []);
+  return narrow;
+}
+
+const toastText = (m: Msg) =>
+  m.kind === "roll" && m.roll
+    ? `${m.fromName} rolled ${m.roll.formula} = ${m.roll.total}`
+    : `${m.fromName}${m.to ? " (whisper)" : ""}: ${m.text ?? ""}`;
+
 export default function Game({ init }: { init: Init }) {
   const { me } = init;
   const isGm = me.role === "gm";
+  const narrow = useNarrow();
+
   const [tokens, setTokens] = useState<Record<string, Token>>(init.tokens);
   const [map, setMap] = useState<MapInfo>(init.map);
   const [members, setMembers] = useState<Member[]>(init.members);
@@ -103,9 +129,18 @@ export default function Game({ init }: { init: Init }) {
   const [snap, setSnap] = useState(() => loadFlag(SNAP_KEY, true));
   const [showGrid, setShowGrid] = useState(() => loadFlag(GRID_KEY, true));
 
+  // panel and menu
+  const [open, setOpen] = useState(isGm); // GM starts with the panel open, players with it closed
+  const [tab, setTab] = useState<Tab>(isGm ? "tokens" : "token");
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [unread, setUnread] = useState(0);
+  const [toast, setToast] = useState<Msg | null>(null);
+  const [hint, setHint] = useState(() => !isGm && loadFlag(HINT_KEY, true));
+
   const viewportRef = useRef<HTMLDivElement>(null);
   const layerRef = useRef<HTMLDivElement>(null);
-  const zoomRef = useRef<HTMLSpanElement>(null);
+  const zoomRef = useRef<HTMLSpanElement | null>(null);
   const mapFileRef = useRef<HTMLInputElement>(null);
   const tokenFileRef = useRef<HTMLInputElement>(null);
   const tokenUploadId = useRef<string | null>(null);
@@ -116,6 +151,8 @@ export default function Game({ init }: { init: Init }) {
   const gesture = useRef<Gesture>(null);
   const dragPos = useRef<Pt | null>(null);
   const lastEmit = useRef(0);
+  const chatVisible = useRef(false);
+  const toastTimer = useRef<number | undefined>(undefined);
 
   const diceRef = useRef<DiceBoxLike | null>(null);
   const dice3dRef = useRef(dice3d);
@@ -124,7 +161,60 @@ export default function Game({ init }: { init: Init }) {
 
   const players = members.filter((m) => m.role === "player");
   const mine = Object.values(tokens).find((t) => t.ownerId === me.id);
+  const ownTokens = Object.values(tokens).filter((t) => t.ownerId === me.id);
   const ownerName = (id: string | null) => (id === null ? "GM" : members.find((m) => m.id === id)?.name ?? "?");
+
+  // ---------- panel ----------
+  const openTab = (t: Tab) => {
+    setTab(t);
+    setOpen(true);
+    setMenuOpen(false);
+    if (t === "chat") {
+      setUnread(0);
+      setToast(null);
+    }
+    if (hint) {
+      setHint(false);
+      try {
+        localStorage.setItem(HINT_KEY, "off");
+      } catch {
+        /* ignore */
+      }
+    }
+  };
+
+  const tabs: { id: Tab; label: string }[] = isGm
+    ? [
+        { id: "chat", label: "Chat" },
+        { id: "dice", label: "Dice" },
+        { id: "tokens", label: "Tokens" },
+        { id: "map", label: "Map" },
+        { id: "invite", label: "Invite" },
+      ]
+    : [
+        { id: "token", label: "Token" },
+        { id: "chat", label: "Chat" },
+        { id: "dice", label: "Dice" },
+      ];
+
+  useEffect(() => {
+    chatVisible.current = open && tab === "chat";
+  }, [open, tab]);
+
+  // The map is full screen, so the page itself must not scroll
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = prev;
+    };
+  }, []);
+
+  // Bring the selected token's card into view
+  useEffect(() => {
+    if (!open || !selectedId) return;
+    document.getElementById(`tok-${selectedId}`)?.scrollIntoView({ block: "nearest" });
+  }, [selectedId, open, tab]);
 
   // ---------- view (pan and zoom) ----------
   // The transform is written straight to the DOM so panning stays smooth
@@ -290,6 +380,13 @@ export default function Game({ init }: { init: Init }) {
           }
         }
         setMessages((all) => (all.some((x) => x.id === m.id) ? all : [...all, m].slice(-200)));
+        // Someone else's message while the chat is not on screen: unread count and a short pop-up
+        if (m.fromId !== me.id && !chatVisible.current) {
+          setUnread((u) => u + 1);
+          setToast(m);
+          window.clearTimeout(toastTimer.current);
+          toastTimer.current = window.setTimeout(() => setToast(null), 6000);
+        }
       });
     });
     return () => {
@@ -302,9 +399,9 @@ export default function Game({ init }: { init: Init }) {
       socket.off("moved");
       socket.off("chat");
     };
-  }, [applyView, fitMap]);
+  }, [applyView, fitMap, me.id]);
 
-  // ---------- pointer handling: drag token, pan, pinch ----------
+  // ---------- pointer handling: tap, drag token, pan, pinch ----------
   const canMove = (t: Token) => isGm || t.ownerId === me.id;
 
   // Pointer position relative to the viewport
@@ -331,11 +428,21 @@ export default function Game({ init }: { init: Init }) {
     };
   };
 
+  // A tap on a token you control opens its panel
+  const onTokenTap = (id: string) => {
+    setSelectedId(id);
+    openTab(isGm ? "tokens" : "token");
+  };
+
   // Drop the token: snap it to the grid (if on) and tell everyone the final spot
   const finishToken = () => {
     const g = gesture.current;
     if (!g || g.kind !== "token") return;
     gesture.current = null;
+    if (!g.moved) {
+      onTokenTap(g.id);
+      return;
+    }
     const t = tokens[g.id];
     const last = dragPos.current;
     if (!t || !last) return;
@@ -347,6 +454,7 @@ export default function Game({ init }: { init: Init }) {
   const onDown = (e: PointerEvent<HTMLDivElement>) => {
     if (e.pointerType === "mouse" && e.button !== 0) return;
     if (pointers.current.size >= 2) return;
+    setMenuOpen(false);
     viewportRef.current!.setPointerCapture(e.pointerId);
     const p = local(e);
     pointers.current.set(e.pointerId, p);
@@ -362,9 +470,9 @@ export default function Game({ init }: { init: Init }) {
     if (t && canMove(t)) {
       const m = toMap(p);
       dragPos.current = null;
-      gesture.current = { kind: "token", id: t.id, dx: m.x - t.x, dy: m.y - t.y };
+      gesture.current = { kind: "token", id: t.id, dx: m.x - t.x, dy: m.y - t.y, sx: p.x, sy: p.y, moved: false };
     } else {
-      gesture.current = { kind: "pan", sx: p.x, sy: p.y, vx: view.current.x, vy: view.current.y };
+      gesture.current = { kind: "pan", sx: p.x, sy: p.y, vx: view.current.x, vy: view.current.y, moved: false };
     }
   };
 
@@ -381,7 +489,13 @@ export default function Game({ init }: { init: Init }) {
       const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
       const z = clampZoom((g.z * (Math.hypot(a.x - b.x, a.y - b.y) || 1)) / g.dist);
       applyView({ x: mid.x - g.mapX * z, y: mid.y - g.mapY * z, z });
-    } else if (g.kind === "pan") {
+      return;
+    }
+
+    if (!g.moved && Math.hypot(p.x - g.sx, p.y - g.sy) > TAP_SLOP) g.moved = true;
+    if (!g.moved) return;
+
+    if (g.kind === "pan") {
       applyView({ ...view.current, x: g.vx + (p.x - g.sx), y: g.vy + (p.y - g.sy) });
     } else {
       const t = tokens[g.id];
@@ -407,7 +521,9 @@ export default function Game({ init }: { init: Init }) {
     } else if (g?.kind === "pinch" && pointers.current.size === 1) {
       // One finger left after a pinch: carry on as a pan without jumping
       const [p] = [...pointers.current.values()];
-      gesture.current = { kind: "pan", sx: p.x, sy: p.y, vx: view.current.x, vy: view.current.y };
+      gesture.current = { kind: "pan", sx: p.x, sy: p.y, vx: view.current.x, vy: view.current.y, moved: true };
+    } else if (g?.kind === "pan" && !g.moved && !isGm) {
+      setOpen(false); // players: tap on empty map closes the panel
     }
     if (pointers.current.size === 0) gesture.current = null;
   };
@@ -423,12 +539,18 @@ export default function Game({ init }: { init: Init }) {
     socket.emit("setHp", { id, hp });
   };
 
-  // New tokens appear in the middle of what the GM is looking at
+  // New tokens appear in the middle of the part of the map the GM can see
   const addToken = () => {
     const { w, h } = vpSize();
+    let sx = w / 2;
+    let sy = h / 2;
+    if (open) {
+      if (narrow) sy = (h * 0.42) / 2;
+      else sx = Math.max(100, (w - 392) / 2);
+    }
     const v = view.current;
-    const cx = (w / 2 - v.x) / v.z;
-    const cy = (h / 2 - v.y) / v.z;
+    const cx = (sx - v.x) / v.z;
+    const cy = (sy - v.y) / v.z;
     const s = snapPos(dims.current, newSize, cx - (newSize * CELL) / 2, cy - (newSize * CELL) / 2);
     socket.emit("addToken", {
       label: newLabel, color: newColor, size: newSize, ownerId: newOwner || null,
@@ -502,337 +624,496 @@ export default function Game({ init }: { init: Init }) {
     <div style={{ fontSize: 13, color: "#c0392b", marginTop: 6 }}>{uploadError}</div>
   ) : null;
 
+  const hpBar = (t: Token) =>
+    t.hp !== undefined && t.maxHp !== undefined ? (
+      <div style={{ height: 8, background: "#0002", borderRadius: 4, overflow: "hidden", marginTop: 6 }}>
+        <div style={{ width: `${clamp((t.hp / t.maxHp) * 100, 0, 100)}%`, height: "100%", background: hpColor(t) }} />
+      </div>
+    ) : null;
+
+  const show = (t: Tab): CSSProperties => ({ display: tab === t ? "block" : "none" });
+  const cardStyle = (id: string): CSSProperties => ({
+    border: id === selectedId ? "2px solid #f1c40f" : "1px solid #ddd",
+    borderRadius: 8, padding: 10, marginBottom: 8,
+  });
+
+  const panelPos: CSSProperties = narrow
+    ? { left: 0, right: 0, bottom: 0, height: "58%", borderRadius: "12px 12px 0 0" }
+    : { top: 12, right: 12, width: 380, height: "min(620px, calc(100% - 24px))" };
+
   return (
-    <div style={{ padding: 20, fontFamily: "sans-serif", maxWidth: 1280, margin: "0 auto" }}>
-      <h2 style={{ marginTop: 0 }}>
-        {init.campaign.name}{" "}
-        <span style={{ fontSize: 12, padding: "2px 8px", borderRadius: 10, background: isGm ? "#222" : "#2a7", color: "#fff" }}>
-          {isGm ? "GM" : "PLAYER"}
-        </span>{" "}
-        <span style={{ fontSize: 13, fontWeight: "normal", color: "#555" }}>
-          {me.name} <button onClick={signOut}>Sign out</button>
-        </span>
-      </h2>
-
-      <div style={{ display: "flex", gap: 20, alignItems: "flex-start", flexWrap: "wrap" }}>
-        {/* LEFT: map */}
-        <div style={{ flex: "1 1 560px", minWidth: 0 }}>
-          <div style={{ ...row, marginBottom: 6 }}>
-            <button onClick={() => zoomBy(1 / 1.25)} title="Zoom out">−</button>
-            <span ref={zoomRef} style={{ minWidth: 44, textAlign: "center", fontSize: 13 }}>100%</span>
-            <button onClick={() => zoomBy(1.25)} title="Zoom in">+</button>
-            <button onClick={resetZoom}>100%</button>
-            <button onClick={fitMap}>Fit map</button>
-            {mine && <button onClick={() => centerOn(mine)}>My token</button>}
-            <label style={{ fontSize: 13, marginLeft: 8 }}>
-              <input type="checkbox" checked={snap} onChange={(e) => setSnap(e.target.checked)} /> Snap to grid
-            </label>
-            <label style={{ fontSize: 13 }}>
-              <input type="checkbox" checked={showGrid} onChange={(e) => setShowGrid(e.target.checked)} /> Show grid
-            </label>
-          </div>
-
-          <div
-            ref={viewportRef}
-            onPointerDown={onDown}
-            onPointerMove={onMove}
-            onPointerUp={onUp}
-            onPointerCancel={onUp}
-            onContextMenu={(e) => e.preventDefault()}
-            style={{
-              position: "relative", width: "100%", height: "min(70vh, 640px)", overflow: "hidden",
-              background: "#3a3a3a", border: "2px solid #333", boxSizing: "border-box",
-              touchAction: "none", userSelect: "none", cursor: "grab",
-            }}
-          >
+    <div style={{ position: "fixed", inset: 0, overflow: "hidden", fontFamily: "sans-serif", background: "#222" }}>
+      {/* ---------- full screen map ---------- */}
+      <div
+        ref={viewportRef}
+        onPointerDown={onDown}
+        onPointerMove={onMove}
+        onPointerUp={onUp}
+        onPointerCancel={onUp}
+        onContextMenu={(e) => e.preventDefault()}
+        style={{
+          position: "absolute", inset: 0, overflow: "hidden", background: "#3a3a3a",
+          touchAction: "none", userSelect: "none", cursor: "grab",
+        }}
+      >
+        <div
+          ref={layerRef}
+          style={{
+            position: "absolute", left: 0, top: 0, width: map.w, height: map.h,
+            transformOrigin: "0 0", boxShadow: "0 0 0 2px #222",
+            background: map.image ? `#bbb url(${map.image}) 0 0 / 100% 100% no-repeat` : "#e8e0cc",
+          }}
+        >
+          {showGrid && (
             <div
-              ref={layerRef}
               style={{
-                position: "absolute", left: 0, top: 0, width: map.w, height: map.h,
-               transformOrigin: "0 0", boxShadow: "0 0 0 2px #222",
-                background: map.image ? `#bbb url(${map.image}) 0 0 / 100% 100% no-repeat` : "#e8e0cc",
+                position: "absolute", inset: 0, pointerEvents: "none",
+                backgroundImage: gridImage, backgroundSize: `${CELL}px ${CELL}px`,
+              }}
+            />
+          )}
+          {Object.values(tokens).map((t) => (
+            <div
+              key={t.id}
+              data-token-id={t.id}
+              title={`${t.label} (${ownerName(t.ownerId)})`}
+              style={{
+                position: "absolute", left: t.x, top: t.y, width: t.size * CELL, height: t.size * CELL,
+                cursor: canMove(t) ? "pointer" : "default",
               }}
             >
-              {showGrid && (
-                <div
+              <div
+                style={{
+                  width: "100%", height: "100%", borderRadius: "50%", boxSizing: "border-box",
+                  background: t.image ? `url(${t.image}) center / cover no-repeat` : t.color,
+                  border: t.image
+                    ? "none"
+                    : `3px solid ${t.ownerId === null ? "#222" : t.ownerId === me.id ? "#f1c40f" : "#fff"}`,
+                }}
+              />
+              <div
+                style={{
+                  position: "absolute", top: "100%", left: "50%", transform: "translateX(-50%)", marginTop: 2,
+                  display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
+                }}
+              >
+                <span
                   style={{
-                    position: "absolute", inset: 0, pointerEvents: "none",
-                    backgroundImage: gridImage, backgroundSize: `${CELL}px ${CELL}px`,
-                  }}
-                />
-              )}
-              {Object.values(tokens).map((t) => (
-                <div
-                  key={t.id}
-                  data-token-id={t.id}
-                  title={`${t.label} (${ownerName(t.ownerId)})`}
-                  style={{
-                    position: "absolute", left: t.x, top: t.y, width: t.size * CELL, height: t.size * CELL,
-                    cursor: canMove(t) ? "pointer" : "default",
+                    maxWidth: Math.max(t.size * CELL + 40, 80), overflow: "hidden", textOverflow: "ellipsis",
+                    whiteSpace: "nowrap", fontSize: 11, fontWeight: 600, color: "#222",
+                    background: "#ffffffcc", borderRadius: 4, padding: "0 4px",
                   }}
                 >
+                  {t.label}
+                </span>
+                {t.hp !== undefined && t.maxHp !== undefined && (
                   <div
                     style={{
-                      width: "100%", height: "100%", borderRadius: "50%", boxSizing: "border-box",
-                      background: t.image ? `url(${t.image}) center / cover no-repeat` : t.color,
-                      border: t.image
-                        ? "none"
-                        : `3px solid ${t.ownerId === null ? "#222" : t.ownerId === me.id ? "#f1c40f" : "#fff"}`,
-                    }}
-                  />
-                  <div
-                    style={{
-                      position: "absolute", top: "100%", left: "50%", transform: "translateX(-50%)", marginTop: 2,
-                      display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
+                      width: Math.max(t.size * CELL, 40), height: 6, background: "#0005",
+                      border: "1px solid #0008", borderRadius: 3, boxSizing: "border-box", overflow: "hidden",
                     }}
                   >
-                    <span
+                    <div
                       style={{
-                        maxWidth: Math.max(t.size * CELL + 40, 80), overflow: "hidden", textOverflow: "ellipsis",
-                        whiteSpace: "nowrap", fontSize: 11, fontWeight: 600, color: "#222",
-                        background: "#ffffffcc", borderRadius: 4, padding: "0 4px",
-                      }}
-                    >
-                      {t.label}
-                    </span>
-                    {t.hp !== undefined && t.maxHp !== undefined && (
-                      <div
-                        style={{
-                          width: Math.max(t.size * CELL, 40), height: 6, background: "#0005",
-                          border: "1px solid #0008", borderRadius: 3, boxSizing: "border-box", overflow: "hidden",
-                        }}
-                      >
-                        <div
-                          style={{
-                            width: `${Math.max(0, Math.min(100, (t.hp / t.maxHp) * 100))}%`,
-                            height: "100%", background: hpColor(t),
-                          }}
-                        />
-                      </div>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-            {/* 3D dice are drawn over the visible area, not the whole map; clicks pass through */}
-            <div id="dice-layer" style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 50 }} />
-          </div>
-          <div style={{ fontSize: 12, color: "#555", marginTop: 6 }}>
-            Scroll or pinch to zoom, drag the background to pan, drag your own token to move it.
-            Gold ring = your token, white = another player, dark = GM token.
-          </div>
-        </div>
-
-        {/* RIGHT: panels */}
-        <div style={{ flex: "0 1 400px", minWidth: 300 }}>
-          {isGm && (
-            <div style={panel}>
-              <b>Invite players</b>
-              <div style={{ ...row, marginTop: 6 }}>
-                <select value={inviteHours} onChange={(e) => setInviteHours(Number(e.target.value))}>
-                  <option value={1}>Expires in 1 hour</option>
-                  <option value={24}>Expires in 24 hours</option>
-                  <option value={168}>Expires in 7 days</option>
-                </select>
-                <label style={{ fontSize: 13 }}>
-                  Max uses{" "}
-                  <input
-                    type="number" min={1} max={20} value={inviteUses} style={{ width: 50 }}
-                    onChange={(e) => setInviteUses(Number(e.target.value))}
-                  />
-                </label>
-                <button onClick={createInvite}>Create link</button>
-              </div>
-              {inviteError && <div style={{ color: "#c0392b", fontSize: 13, marginTop: 4 }}>{inviteError}</div>}
-              {invites.filter((i) => i.expiresAt > Date.now()).map((i) => (
-                <div key={i.code} style={{ marginTop: 8 }}>
-                  <div style={row}>
-                    <input readOnly value={inviteLink(i.code)} style={{ flex: 1, minWidth: 120 }} />
-                    <button onClick={() => navigator.clipboard.writeText(inviteLink(i.code))}>Copy</button>
-                    <button onClick={() => socket.emit("revokeInvite", i.code)}>Revoke</button>
-                  </div>
-                  <div style={{ fontSize: 11, color: "#777" }}>
-                    Used {i.uses}/{i.maxUses}. Expires {new Date(i.expiresAt).toLocaleString()}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {isGm && (
-            <div style={panel}>
-              <b>Map</b>
-              <div style={{ ...row, marginTop: 6 }}>
-                <button disabled={!!busy} onClick={() => mapFileRef.current?.click()}>
-                  {map.image ? "Replace map image" : "Upload map image"}
-                </button>
-                {map.image && <button onClick={() => socket.emit("clearMap")}>Remove image</button>}
-              </div>
-              <div style={{ ...row, marginTop: 6 }}>
-                <label style={{ fontSize: 13 }}>
-                  Squares across{" "}
-                  <input
-                    type="number" min={10} max={100} style={{ width: 60 }}
-                    value={squaresDraft ?? String(Math.round(map.w / CELL))}
-                    onChange={(e) => setSquaresDraft(e.target.value)}
-                  />
-                </label>
-                <button onClick={applySquares}>Apply</button>
-                <span style={{ fontSize: 12, color: "#777" }}>{map.w} × {map.h} px</span>
-              </div>
-              <div style={{ fontSize: 12, color: "#777", marginTop: 6 }}>
-                If the picture's own grid does not line up with the game grid, change "Squares across" and press
-                Apply. PNG, JPG or WebP. Large images are resized for you.
-              </div>
-              {status}
-              <input
-                ref={mapFileRef} type="file" accept="image/png,image/jpeg,image/webp"
-                style={{ display: "none" }} onChange={onMapFile}
-              />
-            </div>
-          )}
-
-          <ChatPanel me={me} members={members} messages={messages} dice3d={dice3d} onDice3d={setDice3d} />
-
-          <div style={panel}>
-            <b>Tokens</b>
-            {Object.values(tokens).length === 0 && <div style={{ color: "#777", marginTop: 6 }}>No tokens yet.</div>}
-            {Object.values(tokens).map((t) =>
-              isGm ? (
-                <div key={t.id} style={{ borderTop: "1px solid #eee", marginTop: 8, paddingTop: 8 }}>
-                  <div style={row}>
-                    <input type="color" value={t.color} onChange={(e) => update(t.id, { color: e.target.value })} />
-                    <input
-                      key={t.id + t.label}
-                      defaultValue={t.label}
-                      maxLength={20}
-                      style={{ flex: 1, minWidth: 80 }}
-                      onBlur={(e) => {
-                        const v = e.target.value.trim();
-                        if (v && v !== t.label) update(t.id, { label: v });
+                        width: `${clamp((t.hp / t.maxHp) * 100, 0, 100)}%`,
+                        height: "100%", background: hpColor(t),
                       }}
                     />
-                    <button onClick={() => centerOn(t)}>Find</button>
-                    <button onClick={() => socket.emit("removeToken", t.id)}>Delete</button>
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+        {/* 3D dice are drawn over the visible area, not the whole map; clicks pass through */}
+        <div id="dice-layer" style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 50 }} />
+      </div>
+
+      {/* ---------- menu button and menu ---------- */}
+      <button
+        onClick={() => setMenuOpen((v) => !v)}
+        title="Menu"
+        style={{
+          position: "absolute", top: 12, left: 12, zIndex: 100, width: 40, height: 40, borderRadius: 20,
+          border: "1px solid #888", background: "#fffe", fontSize: 18, cursor: "pointer",
+        }}
+      >
+        ☰
+        {unread > 0 && (
+          <span
+            style={{
+              position: "absolute", top: -4, right: -4, background: "#e74c3c", color: "#fff", borderRadius: 10,
+              fontSize: 11, minWidth: 18, height: 18, lineHeight: "18px", textAlign: "center",
+            }}
+          >
+            {unread}
+          </span>
+        )}
+      </button>
+
+      {menuOpen && (
+        <div style={{ ...floating, position: "absolute", top: 60, left: 12, zIndex: 100, width: 270, padding: 12 }}>
+          <div>
+            <b>{init.campaign.name}</b>
+          </div>
+          <div style={{ fontSize: 12, color: "#555", marginTop: 2 }}>
+            {me.name} ({isGm ? "GM" : "player"}){" "}
+            <button onClick={signOut}>Sign out</button>
+          </div>
+          <div style={{ ...row, marginTop: 10 }}>
+            <button onClick={() => zoomBy(1 / 1.25)} title="Zoom out">−</button>
+            <span
+              ref={(el) => {
+                zoomRef.current = el;
+                if (el) el.textContent = `${Math.round(view.current.z * 100)}%`;
+              }}
+              style={{ minWidth: 44, textAlign: "center", fontSize: 13 }}
+            />
+            <button onClick={() => zoomBy(1.25)} title="Zoom in">+</button>
+            <button onClick={resetZoom}>100%</button>
+          </div>
+          <div style={{ ...row, marginTop: 6 }}>
+            <button onClick={fitMap}>Fit map</button>
+            {mine && <button onClick={() => centerOn(mine)}>My token</button>}
+          </div>
+          <label style={{ display: "block", fontSize: 13, marginTop: 8 }}>
+            <input type="checkbox" checked={snap} onChange={(e) => setSnap(e.target.checked)} /> Snap to grid
+          </label>
+          <label style={{ display: "block", fontSize: 13 }}>
+            <input type="checkbox" checked={showGrid} onChange={(e) => setShowGrid(e.target.checked)} /> Show grid
+          </label>
+          {!isGm && (
+            <div style={{ ...row, marginTop: 10 }}>
+              <button onClick={() => openTab("chat")}>Chat{unread > 0 ? ` (${unread})` : ""}</button>
+              <button onClick={() => openTab("dice")}>Dice</button>
+              {mine && <button onClick={() => { setSelectedId(mine.id); openTab("token"); }}>My token</button>}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ---------- GM dock (panel minimized) ---------- */}
+      {!open && isGm && (
+        <div
+          style={{
+            position: "absolute", right: 12, bottom: 12, zIndex: 90, display: "flex", gap: 6,
+            flexWrap: "wrap", justifyContent: "flex-end", maxWidth: "calc(100% - 24px)",
+          }}
+        >
+          {tabs.map((t) => (
+            <button
+              key={t.id}
+              onClick={() => openTab(t.id)}
+              style={{
+                ...floating, borderRadius: 16, padding: "6px 12px", cursor: "pointer", fontSize: 13,
+              }}
+            >
+              {t.label}
+              {t.id === "chat" && unread > 0 ? ` (${unread})` : ""}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* ---------- first-time hint for players ---------- */}
+      {hint && !open && (
+        <div
+          style={{
+            position: "absolute", left: "50%", bottom: 16, transform: "translateX(-50%)", zIndex: 90,
+            background: "#222d", color: "#fff", borderRadius: 16, padding: "8px 14px", fontSize: 13,
+            maxWidth: "calc(100% - 32px)", textAlign: "center", pointerEvents: "none",
+          }}
+        >
+          Tap your token to open chat, dice and your stats
+        </div>
+      )}
+
+      {/* ---------- new message pop-up ---------- */}
+      {toast && !(open && tab === "chat") && (
+        <div
+          onClick={() => openTab("chat")}
+          style={{
+            ...floating, position: "absolute", left: 12, zIndex: 110, maxWidth: "min(360px, calc(100% - 24px))",
+            bottom: narrow && open ? "calc(58% + 12px)" : 12, padding: "8px 12px", fontSize: 13, cursor: "pointer",
+            background: "#f3ecff",
+          }}
+        >
+          {toastText(toast)}
+        </div>
+      )}
+
+      {/* ---------- tabbed panel ---------- */}
+      {open && (
+        <div
+          style={{
+            position: "absolute", zIndex: 90, display: "flex", flexDirection: "column",
+            background: "#fff", border: "1px solid #bbb", boxShadow: "0 6px 24px #0005",
+            borderRadius: 10, ...panelPos,
+          }}
+        >
+          <div
+            style={{
+              display: "flex", alignItems: "center", gap: 4, padding: "8px 8px 0",
+              borderBottom: "1px solid #ddd", flexWrap: "wrap",
+            }}
+          >
+            {tabs.map((t) => (
+              <button
+                key={t.id}
+                onClick={() => openTab(t.id)}
+                style={{
+                  border: "none", cursor: "pointer", fontSize: 13, padding: "6px 10px",
+                  borderRadius: "6px 6px 0 0",
+                  background: tab === t.id ? "#222" : "transparent",
+                  color: tab === t.id ? "#fff" : "#222",
+                }}
+              >
+                {t.label}
+                {t.id === "chat" && unread > 0 ? ` (${unread})` : ""}
+              </button>
+            ))}
+            <span style={{ flex: 1 }} />
+            <button
+              onClick={() => setOpen(false)}
+              title={isGm ? "Minimize" : "Close"}
+              style={{ border: "none", background: "transparent", cursor: "pointer", fontSize: 16 }}
+            >
+              {isGm ? "–" : "✕"}
+            </button>
+          </div>
+
+          <div style={{ flex: 1, overflowY: "auto", padding: 12 }}>
+            <div style={show("chat")}>
+              <ChatPanel mode="chat" me={me} members={members} messages={messages} dice3d={dice3d} onDice3d={setDice3d} />
+            </div>
+            <div style={show("dice")}>
+              <ChatPanel mode="dice" me={me} members={members} messages={messages} dice3d={dice3d} onDice3d={setDice3d} />
+            </div>
+
+            {/* Player: own token(s) */}
+            {!isGm && (
+              <div style={show("token")}>
+                {ownTokens.length === 0 && <div style={{ color: "#777" }}>You do not have a token yet.</div>}
+                {ownTokens.map((t) => (
+                  <div key={t.id} id={`tok-${t.id}`} style={cardStyle(t.id)}>
+                    <div style={row}>
+                      <span
+                        style={{
+                          width: 44, height: 44, borderRadius: "50%", flex: "none", border: "2px solid #ddd",
+                          background: t.image ? `url(${t.image}) center / cover no-repeat` : t.color,
+                        }}
+                      />
+                      <div style={{ flex: 1 }}>
+                        <b>{t.label}</b>
+                        <div style={{ fontSize: 12, color: "#777" }}>Size {t.size}x{t.size}</div>
+                      </div>
+                      <button onClick={() => centerOn(t)}>Find</button>
+                    </div>
+                    <div style={{ ...row, marginTop: 8 }}>
+                      HP
+                      <input
+                        key={`${t.id}hp${t.hp}`} type="number" defaultValue={t.hp} style={{ width: 60 }}
+                        onBlur={(e) => {
+                          const v = Number(e.target.value);
+                          if (!Number.isNaN(v) && v !== t.hp) setHp(t.id, v);
+                        }}
+                      />
+                      / {t.maxHp}
+                    </div>
+                    {hpBar(t)}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* GM: all tokens and the add form */}
+            {isGm && (
+              <div style={show("tokens")}>
+                <details style={{ marginBottom: 10 }}>
+                  <summary style={{ cursor: "pointer", fontWeight: 600 }}>Add token</summary>
+                  <div style={{ ...row, marginTop: 8 }}>
+                    <input
+                      placeholder="Token name"
+                      value={newLabel}
+                      maxLength={20}
+                      onChange={(e) => setNewLabel(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && addToken()}
+                      style={{ flex: 1, minWidth: 100 }}
+                    />
+                    <input type="color" value={newColor} onChange={(e) => setNewColor(e.target.value)} />
                   </div>
                   <div style={{ ...row, marginTop: 6 }}>
-                    <select value={t.size} onChange={(e) => update(t.id, { size: Number(e.target.value) })}>
+                    <select value={newSize} onChange={(e) => setNewSize(Number(e.target.value))}>
                       {SIZES.map((s) => (
                         <option key={s} value={s}>{s}x{s}</option>
                       ))}
                     </select>
-                    <select value={t.ownerId ?? ""} onChange={(e) => update(t.id, { ownerId: e.target.value || null })}>
+                    <select value={newOwner} onChange={(e) => setNewOwner(e.target.value)}>
                       <option value="">GM (NPC / monster)</option>
                       {players.map((p) => (
                         <option key={p.id} value={p.id}>{p.name}</option>
                       ))}
                     </select>
-                  </div>
-                  <div style={{ ...row, marginTop: 6 }}>
-                    HP
-                    <input
-                      key={`${t.id}hp${t.hp}`} type="number" defaultValue={t.hp} style={{ width: 55 }}
-                      onBlur={(e) => {
-                        const v = Number(e.target.value);
-                        if (!Number.isNaN(v) && v !== t.hp) update(t.id, { hp: v });
-                      }}
-                    />
-                    /
-                    <input
-                      key={`${t.id}max${t.maxHp}`} type="number" defaultValue={t.maxHp} style={{ width: 55 }}
-                      onBlur={(e) => {
-                        const v = Number(e.target.value);
-                        if (!Number.isNaN(v) && v !== t.maxHp) update(t.id, { maxHp: v });
-                      }}
-                    />
-                  </div>
-                  <div style={{ ...row, marginTop: 6 }}>
-                    <button
-                      disabled={!!busy}
-                      onClick={() => {
-                        tokenUploadId.current = t.id;
-                        tokenFileRef.current?.click();
-                      }}
-                    >
-                      {t.image ? "Change image" : "Add image"}
-                    </button>
-                    {t.image && <button onClick={() => socket.emit("clearTokenImage", t.id)}>Remove image</button>}
-                  </div>
-                </div>
-              ) : (
-                <div key={t.id} style={{ ...row, borderTop: "1px solid #eee", marginTop: 8, paddingTop: 8 }}>
-                  <span style={{ width: 14, height: 14, borderRadius: "50%", background: t.color, display: "inline-block" }} />
-                  <span style={{ flex: 1 }}>{t.label}</span>
-                  <span style={{ fontSize: 12, color: "#555" }}>{ownerName(t.ownerId)}</span>
-                  {t.ownerId === me.id && t.hp !== undefined ? (
-                    <span style={{ fontSize: 13 }}>
+                    <label>
                       HP{" "}
+                      <input
+                        type="number" min={1} max={9999} value={newHp} style={{ width: 60 }}
+                        onChange={(e) => setNewHp(Number(e.target.value))}
+                      />
+                    </label>
+                    <button onClick={addToken}>Add</button>
+                  </div>
+                  <div style={{ fontSize: 12, color: "#777", marginTop: 6 }}>
+                    The token appears in the middle of what you see. Then use "Add image" on its card.
+                  </div>
+                </details>
+
+                {status}
+                {Object.values(tokens).length === 0 && <div style={{ color: "#777" }}>No tokens yet.</div>}
+                {Object.values(tokens).map((t) => (
+                  <div key={t.id} id={`tok-${t.id}`} style={cardStyle(t.id)}>
+                    <div style={row}>
+                      <input type="color" value={t.color} onChange={(e) => update(t.id, { color: e.target.value })} />
+                      <input
+                        key={t.id + t.label}
+                        defaultValue={t.label}
+                        maxLength={20}
+                        style={{ flex: 1, minWidth: 80 }}
+                        onBlur={(e) => {
+                          const v = e.target.value.trim();
+                          if (v && v !== t.label) update(t.id, { label: v });
+                        }}
+                      />
+                      <button onClick={() => centerOn(t)}>Find</button>
+                      <button onClick={() => socket.emit("removeToken", t.id)}>Delete</button>
+                    </div>
+                    <div style={{ ...row, marginTop: 6 }}>
+                      <select value={t.size} onChange={(e) => update(t.id, { size: Number(e.target.value) })}>
+                        {SIZES.map((s) => (
+                          <option key={s} value={s}>{s}x{s}</option>
+                        ))}
+                      </select>
+                      <select value={t.ownerId ?? ""} onChange={(e) => update(t.id, { ownerId: e.target.value || null })}>
+                        <option value="">GM (NPC / monster)</option>
+                        {players.map((p) => (
+                          <option key={p.id} value={p.id}>{p.name}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div style={{ ...row, marginTop: 6 }}>
+                      HP
                       <input
                         key={`${t.id}hp${t.hp}`} type="number" defaultValue={t.hp} style={{ width: 55 }}
                         onBlur={(e) => {
                           const v = Number(e.target.value);
-                          if (!Number.isNaN(v) && v !== t.hp) setHp(t.id, v);
+                          if (!Number.isNaN(v) && v !== t.hp) update(t.id, { hp: v });
                         }}
-                      />{" "}
-                      / {t.maxHp}
-                    </span>
-                  ) : (
-                    t.hp !== undefined && <span style={{ fontSize: 12, color: "#555" }}>HP {t.hp}/{t.maxHp}</span>
-                  )}
-                </div>
-              )
+                      />
+                      /
+                      <input
+                        key={`${t.id}max${t.maxHp}`} type="number" defaultValue={t.maxHp} style={{ width: 55 }}
+                        onBlur={(e) => {
+                          const v = Number(e.target.value);
+                          if (!Number.isNaN(v) && v !== t.maxHp) update(t.id, { maxHp: v });
+                        }}
+                      />
+                    </div>
+                    <div style={{ ...row, marginTop: 6 }}>
+                      <button
+                        disabled={!!busy}
+                        onClick={() => {
+                          tokenUploadId.current = t.id;
+                          tokenFileRef.current?.click();
+                        }}
+                      >
+                        {t.image ? "Change image" : "Add image"}
+                      </button>
+                      {t.image && <button onClick={() => socket.emit("clearTokenImage", t.id)}>Remove image</button>}
+                    </div>
+                  </div>
+                ))}
+              </div>
             )}
-            {isGm && status}
+
+            {/* GM: map settings */}
             {isGm && (
-              <input
-                ref={tokenFileRef} type="file" accept="image/png,image/jpeg,image/webp"
-                style={{ display: "none" }} onChange={onTokenFile}
-              />
+              <div style={show("map")}>
+                <div style={row}>
+                  <button disabled={!!busy} onClick={() => mapFileRef.current?.click()}>
+                    {map.image ? "Replace map image" : "Upload map image"}
+                  </button>
+                  {map.image && <button onClick={() => socket.emit("clearMap")}>Remove image</button>}
+                </div>
+                <div style={{ ...row, marginTop: 8 }}>
+                  <label style={{ fontSize: 13 }}>
+                    Squares across{" "}
+                    <input
+                      type="number" min={10} max={100} style={{ width: 60 }}
+                      value={squaresDraft ?? String(Math.round(map.w / CELL))}
+                      onChange={(e) => setSquaresDraft(e.target.value)}
+                    />
+                  </label>
+                  <button onClick={applySquares}>Apply</button>
+                  <span style={{ fontSize: 12, color: "#777" }}>{map.w} × {map.h} px</span>
+                </div>
+                <div style={{ fontSize: 12, color: "#777", marginTop: 8 }}>
+                  If the picture's own grid does not line up with the game grid, change "Squares across" and press
+                  Apply. PNG, JPG or WebP. Large images are resized for you.
+                </div>
+                {status}
+              </div>
+            )}
+
+            {/* GM: invite links */}
+            {isGm && (
+              <div style={show("invite")}>
+                <div style={row}>
+                  <select value={inviteHours} onChange={(e) => setInviteHours(Number(e.target.value))}>
+                    <option value={1}>Expires in 1 hour</option>
+                    <option value={24}>Expires in 24 hours</option>
+                    <option value={168}>Expires in 7 days</option>
+                  </select>
+                  <label style={{ fontSize: 13 }}>
+                    Max uses{" "}
+                    <input
+                      type="number" min={1} max={20} value={inviteUses} style={{ width: 50 }}
+                      onChange={(e) => setInviteUses(Number(e.target.value))}
+                    />
+                  </label>
+                  <button onClick={createInvite}>Create link</button>
+                </div>
+                {inviteError && <div style={{ color: "#c0392b", fontSize: 13, marginTop: 4 }}>{inviteError}</div>}
+                {invites.filter((i) => i.expiresAt > Date.now()).map((i) => (
+                  <div key={i.code} style={{ marginTop: 10 }}>
+                    <div style={row}>
+                      <input readOnly value={inviteLink(i.code)} style={{ flex: 1, minWidth: 120 }} />
+                      <button onClick={() => navigator.clipboard.writeText(inviteLink(i.code))}>Copy</button>
+                      <button onClick={() => socket.emit("revokeInvite", i.code)}>Revoke</button>
+                    </div>
+                    <div style={{ fontSize: 11, color: "#777" }}>
+                      Used {i.uses}/{i.maxUses}. Expires {new Date(i.expiresAt).toLocaleString()}
+                    </div>
+                  </div>
+                ))}
+              </div>
             )}
           </div>
-
-          {isGm && (
-            <div style={panel}>
-              <b>Add token</b>
-              <div style={{ ...row, marginTop: 6 }}>
-                <input
-                  placeholder="Token name"
-                  value={newLabel}
-                  maxLength={20}
-                  onChange={(e) => setNewLabel(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && addToken()}
-                  style={{ flex: 1, minWidth: 100 }}
-                />
-                <input type="color" value={newColor} onChange={(e) => setNewColor(e.target.value)} />
-              </div>
-              <div style={{ ...row, marginTop: 6 }}>
-                <select value={newSize} onChange={(e) => setNewSize(Number(e.target.value))}>
-                  {SIZES.map((s) => (
-                    <option key={s} value={s}>{s}x{s}</option>
-                  ))}
-                </select>
-                <select value={newOwner} onChange={(e) => setNewOwner(e.target.value)}>
-                  <option value="">GM (NPC / monster)</option>
-                  {players.map((p) => (
-                    <option key={p.id} value={p.id}>{p.name}</option>
-                  ))}
-                </select>
-                <label>
-                  HP{" "}
-                  <input
-                    type="number" min={1} max={9999} value={newHp} style={{ width: 60 }}
-                    onChange={(e) => setNewHp(Number(e.target.value))}
-                  />
-                </label>
-                <button onClick={addToken}>Add</button>
-              </div>
-              <div style={{ fontSize: 12, color: "#777", marginTop: 6 }}>
-                Add the token first, then use "Add image" on it in the Tokens list.
-              </div>
-            </div>
-          )}
         </div>
-      </div>
+      )}
+
+      {/* hidden file pickers (GM) */}
+      {isGm && (
+        <>
+          <input
+            ref={mapFileRef} type="file" accept="image/png,image/jpeg,image/webp"
+            style={{ display: "none" }} onChange={onMapFile}
+          />
+          <input
+            ref={tokenFileRef} type="file" accept="image/png,image/jpeg,image/webp"
+            style={{ display: "none" }} onChange={onTokenFile}
+          />
+        </>
+      )}
     </div>
   );
 }
