@@ -50,7 +50,7 @@ function allow(socket: Socket, key: string, max: number, windowMs: number) {
 
 // Validates everything coming from a browser before it is stored
 function clean(raw: Partial<Token>, id: string, camp: Campaign): Token {
-  const size = clamp(Math.round(Number(raw.size) || 1), 1, 5);
+  const size = clamp(Math.round(Number(raw.size) || 1), 1, 10);
   const color = typeof raw.color === "string" && /^#[0-9a-fA-F]{6}$/.test(raw.color) ? raw.color : "#888888";
   const label = String(raw.label ?? "").trim().slice(0, 20) || "Token";
   const ownerId = typeof raw.ownerId === "string" && camp.memberIds.includes(raw.ownerId) ? raw.ownerId : null;
@@ -63,7 +63,11 @@ function clean(raw: Partial<Token>, id: string, camp: Campaign): Token {
     typeof raw.image === "string" && Object.values(camp.assets).some((a) => assetUrl(camp, a.file) === raw.image)
       ? raw.image
       : undefined;
-  return { id, x, y, color, label, size, ownerId, hp, maxHp, image };
+  const rot = (((Math.round(Number(raw.rot)) || 0) % 360) + 360) % 360;
+  const flip = raw.flip === true;
+  const hidden = raw.hidden === true;
+  const z = Math.round(Number(raw.z) || 0);
+  return { id, x, y, color, label, size, ownerId, hp, maxHp, image, rot, flip, hidden, z };
 }
 
 // Players do not see the HP of GM tokens (monsters)
@@ -73,15 +77,23 @@ function forPlayers(t: Token) {
   return rest;
 }
 
+// Players never receive hidden tokens at all
 function tokensFor(camp: Campaign, acc: Account) {
   if (acc.role === "gm") return camp.tokens;
-  return Object.fromEntries(Object.entries(camp.tokens).map(([id, t]) => [id, forPlayers(t)]));
+  return Object.fromEntries(
+    Object.entries(camp.tokens)
+      .filter(([, t]) => !t.hidden)
+      .map(([id, t]) => [id, forPlayers(t)])
+  );
 }
 
 function emitToken(camp: Campaign, event: string, t: Token) {
   io.to(gmRoom(camp)).emit(event, t);
-  io.to(playerRoom(camp)).emit(event, forPlayers(t));
+  if (!t.hidden) io.to(playerRoom(camp)).emit(event, forPlayers(t));
 }
+
+// Layer number for a new token: above all others
+const nextZ = (camp: Campaign) => Object.values(camp.tokens).reduce((m, t) => Math.max(m, t.z ?? 0), -1) + 1;
 
 function membersOf(camp: Campaign) {
   return [camp.gmId, ...camp.memberIds]
@@ -251,7 +263,10 @@ app.use((err: { type?: string }, _req: express.Request, res: express.Response, _
   res.status(big ? 413 : 400).json({ error: big ? "Image is too large" : "Bad request" });
 });
 
-type Patch = { id: string; label?: string; color?: string; size?: number; ownerId?: string | null; hp?: number; maxHp?: number };
+type Patch = {
+  id: string; label?: string; color?: string; size?: number; ownerId?: string | null;
+  hp?: number; maxHp?: number; hidden?: boolean;
+};
 
 io.on("connection", (socket) => {
   const session = socket.handshake.auth?.session;
@@ -371,7 +386,10 @@ io.on("connection", (socket) => {
     const id = randomUUID();
     const pos = 20 + (count % 10) * 30;
     const hasPos = typeof raw.x === "number" && typeof raw.y === "number";
-    camp.tokens[id] = clean({ ...raw, x: hasPos ? raw.x : pos, y: hasPos ? raw.y : pos }, id, camp);
+    camp.tokens[id] = clean(
+      { ...raw, x: hasPos ? raw.x : pos, y: hasPos ? raw.y : pos, z: nextZ(camp) },
+      id, camp
+    );
     save();
     emitToken(camp, "tokenAdded", camp.tokens[id]);
   });
@@ -380,7 +398,8 @@ io.on("connection", (socket) => {
     if (!isGm || !p) return;
     const cur = camp.tokens[p.id];
     if (!cur) return;
-    camp.tokens[cur.id] = clean(
+    const wasHidden = !!cur.hidden;
+    const next = clean(
       {
         ...cur,
         label: p.label ?? cur.label,
@@ -389,11 +408,23 @@ io.on("connection", (socket) => {
         ownerId: p.ownerId === undefined ? cur.ownerId : p.ownerId,
         hp: p.hp ?? cur.hp,
         maxHp: p.maxHp ?? cur.maxHp,
+        hidden: p.hidden ?? cur.hidden,
       },
       cur.id, camp
     );
+    camp.tokens[cur.id] = next;
     save();
-    emitToken(camp, "tokenUpdated", camp.tokens[cur.id]);
+    if (!wasHidden && next.hidden) {
+      // Hiding: players lose the token completely
+      io.to(gmRoom(camp)).emit("tokenUpdated", next);
+      io.to(playerRoom(camp)).emit("tokenRemoved", next.id);
+    } else if (wasHidden && !next.hidden) {
+      // Revealing: players receive it as a new token
+      io.to(gmRoom(camp)).emit("tokenUpdated", next);
+      io.to(playerRoom(camp)).emit("tokenAdded", forPlayers(next));
+    } else {
+      emitToken(camp, "tokenUpdated", next);
+    }
   });
 
   socket.on("clearTokenImage", (id: string) => {
@@ -403,6 +434,37 @@ io.on("connection", (socket) => {
     t.image = undefined;
     gcAssets(camp);
     emitToken(camp, "tokenUpdated", t);
+  });
+    // Rotate / flip the picture: the GM for any token, a player for their own
+  socket.on("setLook", (p: { id: string; rot?: number; flip?: boolean }) => {
+    const t = camp.tokens[p?.id];
+    if (!t || (!isGm && (t.ownerId !== acc.id || t.hidden))) return;
+    if (p.rot !== undefined) t.rot = (((Math.round(Number(p.rot)) || 0) % 360) + 360) % 360;
+    if (p.flip !== undefined) t.flip = p.flip === true;
+    save();
+    emitToken(camp, "tokenUpdated", t);
+  });
+
+  // GM: change the layer order of tokens
+  socket.on("reorder", (p: { id: string; op: "front" | "back" | "up" | "down" }) => {
+    if (!isGm || !p) return;
+    const list = Object.values(camp.tokens).sort((a, b) => (a.z ?? 0) - (b.z ?? 0));
+    const i = list.findIndex((t) => t.id === p.id);
+    if (i < 0) return;
+    const [t] = list.splice(i, 1);
+    const j =
+      p.op === "front" ? list.length
+      : p.op === "back" ? 0
+      : p.op === "up" ? Math.min(i + 1, list.length)
+      : Math.max(i - 1, 0);
+    list.splice(j, 0, t);
+    list.forEach((tok, idx) => {
+      if ((tok.z ?? 0) !== idx) {
+        tok.z = idx;
+        emitToken(camp, "tokenUpdated", tok);
+      }
+    });
+    save();
   });
 
   socket.on("removeToken", (id: string) => {
@@ -415,7 +477,7 @@ io.on("connection", (socket) => {
   // Players: only their own token
   socket.on("setHp", ({ id, hp }: { id: string; hp: number }) => {
     const t = camp.tokens[id];
-    if (!t || (!isGm && t.ownerId !== acc.id)) return;
+    if (!t || (!isGm && (t.ownerId !== acc.id || t.hidden))) return;
     t.hp = clamp(Math.round(Number(hp) || 0), 0, t.maxHp);
     save();
     emitToken(camp, "tokenUpdated", t);
@@ -423,11 +485,12 @@ io.on("connection", (socket) => {
 
   socket.on("move", ({ id, x, y }: { id: string; x: number; y: number }) => {
     const t = camp.tokens[id];
-    if (!t || (!isGm && t.ownerId !== acc.id)) return;
+    if (!t || (!isGm && (t.ownerId !== acc.id || t.hidden))) return;
     t.x = clamp(Number(x) || 0, 0, camp.map.w - t.size * CELL);
     t.y = clamp(Number(y) || 0, 0, camp.map.h - t.size * CELL);
     save();
-    socket.to(everyone(camp)).emit("moved", { id, x: t.x, y: t.y });
+    // Moves of hidden tokens are only sent to the GM
+    socket.to(t.hidden ? [gmRoom(camp)] : everyone(camp)).emit("moved", { id, x: t.x, y: t.y });
   });
 
   // Chat and dice

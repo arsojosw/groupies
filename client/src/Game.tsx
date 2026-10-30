@@ -13,14 +13,15 @@ type DiceBoxLike = {
   clearDice?: () => void;
 };
 type TokenPatch = {
-  label?: string; color?: string; size?: number; ownerId?: string | null; hp?: number; maxHp?: number;
+  label?: string; color?: string; size?: number; ownerId?: string | null;
+  hp?: number; maxHp?: number; hidden?: boolean;
 };
 type View = { x: number; y: number; z: number }; // pan in screen px, zoom factor
 type Pt = { x: number; y: number };
 type Dims = { w: number; h: number };
 type Tab = "token" | "chat" | "dice" | "tokens" | "map" | "invite";
 type Gesture =
-  | { kind: "pan"; sx: number; sy: number; vx: number; vy: number; moved: boolean }
+  | { kind: "pan"; sx: number; sy: number; vx: number; vy: number; moved: boolean; tap?: string }
   | { kind: "token"; id: string; dx: number; dy: number; sx: number; sy: number; moved: boolean }
   | { kind: "pinch"; dist: number; z: number; mapX: number; mapY: number }
   | null;
@@ -30,11 +31,13 @@ const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 4;
 const EDGE = 60; // how far past the map edge you can pan
 const TAP_SLOP = 6; // movement (px) under which a press counts as a tap
+const ROTATE_STEP = 15; // degrees per click of the rotate buttons
 const DICE_KEY = "vtt:dice3d";
 const SNAP_KEY = "vtt:snap";
 const GRID_KEY = "vtt:grid";
 const HINT_KEY = "vtt:hint";
-const SIZES = [1, 2, 3, 4, 5];
+const NAMES_KEY = "vtt:names";
+const SIZES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 const D3_SIDES = [4, 6, 8, 10, 12, 20];
 const MAX_3D_DICE = 8;
 
@@ -119,6 +122,7 @@ export default function Game({ init }: { init: Init }) {
   const [newSize, setNewSize] = useState(1);
   const [newOwner, setNewOwner] = useState("");
   const [newHp, setNewHp] = useState(10);
+  const [newHidden, setNewHidden] = useState(false);
   const [inviteHours, setInviteHours] = useState(24);
   const [inviteUses, setInviteUses] = useState(6);
   const [inviteError, setInviteError] = useState("");
@@ -128,12 +132,14 @@ export default function Game({ init }: { init: Init }) {
   const [dice3d, setDice3d] = useState(() => loadFlag(DICE_KEY, true));
   const [snap, setSnap] = useState(() => loadFlag(SNAP_KEY, true));
   const [showGrid, setShowGrid] = useState(() => loadFlag(GRID_KEY, true));
+  const [showNames, setShowNames] = useState(() => loadFlag(NAMES_KEY, false));
 
   // panel and menu
   const [open, setOpen] = useState(isGm); // GM starts with the panel open, players with it closed
   const [tab, setTab] = useState<Tab>(isGm ? "tokens" : "token");
   const [menuOpen, setMenuOpen] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [hoverId, setHoverId] = useState<string | null>(null);
   const [unread, setUnread] = useState(0);
   const [toast, setToast] = useState<Msg | null>(null);
   const [hint, setHint] = useState(() => !isGm && loadFlag(HINT_KEY, true));
@@ -163,6 +169,8 @@ export default function Game({ init }: { init: Init }) {
   const mine = Object.values(tokens).find((t) => t.ownerId === me.id);
   const ownTokens = Object.values(tokens).filter((t) => t.ownerId === me.id);
   const ownerName = (id: string | null) => (id === null ? "GM" : members.find((m) => m.id === id)?.name ?? "?");
+  // Lowest layer first, so higher layers are drawn on top
+  const byLayer = [...Object.values(tokens)].sort((a, b) => (a.z ?? 0) - (b.z ?? 0));
 
   // ---------- panel ----------
   const openTab = (t: Tab) => {
@@ -311,10 +319,11 @@ export default function Game({ init }: { init: Init }) {
     try {
       localStorage.setItem(SNAP_KEY, snap ? "on" : "off");
       localStorage.setItem(GRID_KEY, showGrid ? "on" : "off");
+      localStorage.setItem(NAMES_KEY, showNames ? "on" : "off");
     } catch {
       /* ignore */
     }
-  }, [snap, showGrid]);
+  }, [snap, showGrid, showNames]);
 
   // ---------- 3D dice layer ----------
   useEffect(() => {
@@ -401,7 +410,7 @@ export default function Game({ init }: { init: Init }) {
     };
   }, [applyView, fitMap, me.id]);
 
-  // ---------- pointer handling: tap, drag token, pan, pinch ----------
+  // ---------- pointer handling: tap, hover, drag token, pan, pinch ----------
   const canMove = (t: Token) => isGm || t.ownerId === me.id;
 
   // Pointer position relative to the viewport
@@ -467,16 +476,25 @@ export default function Game({ init }: { init: Init }) {
 
     const el = (e.target as HTMLElement).closest("[data-token-id]") as HTMLElement | null;
     const t = el ? tokens[el.dataset.tokenId ?? ""] : undefined;
+    if (t) setSelectedId(t.id); // a pressed token keeps its name visible
     if (t && canMove(t)) {
       const m = toMap(p);
       dragPos.current = null;
       gesture.current = { kind: "token", id: t.id, dx: m.x - t.x, dy: m.y - t.y, sx: p.x, sy: p.y, moved: false };
     } else {
-      gesture.current = { kind: "pan", sx: p.x, sy: p.y, vx: view.current.x, vy: view.current.y, moved: false };
+      gesture.current = {
+        kind: "pan", sx: p.x, sy: p.y, vx: view.current.x, vy: view.current.y, moved: false, tap: t?.id,
+      };
     }
   };
 
   const onMove = (e: PointerEvent<HTMLDivElement>) => {
+    // Mouse hover (no button pressed): remember which token is under the pointer
+    if (e.pointerType === "mouse" && e.buttons === 0) {
+      const el = (e.target as HTMLElement).closest("[data-token-id]") as HTMLElement | null;
+      const id = el?.dataset.tokenId ?? null;
+      setHoverId((cur) => (cur === id ? cur : id));
+    }
     if (!pointers.current.has(e.pointerId)) return;
     const p = local(e);
     pointers.current.set(e.pointerId, p);
@@ -522,8 +540,13 @@ export default function Game({ init }: { init: Init }) {
       // One finger left after a pinch: carry on as a pan without jumping
       const [p] = [...pointers.current.values()];
       gesture.current = { kind: "pan", sx: p.x, sy: p.y, vx: view.current.x, vy: view.current.y, moved: true };
-    } else if (g?.kind === "pan" && !g.moved && !isGm) {
-      setOpen(false); // players: tap on empty map closes the panel
+    } else if (g?.kind === "pan" && !g.moved) {
+      if (g.tap) {
+        setSelectedId(g.tap); // tap on a token you cannot move: show its name
+      } else {
+        setSelectedId(null); // tap on empty map
+        if (!isGm) setOpen(false); // players: also closes the panel
+      }
     }
     if (pointers.current.size === 0) gesture.current = null;
   };
@@ -537,6 +560,15 @@ export default function Game({ init }: { init: Init }) {
   const setHp = (id: string, hp: number) => {
     setTokens((all) => ({ ...all, [id]: { ...all[id], hp } }));
     socket.emit("setHp", { id, hp });
+  };
+
+  // Rotate / flip the picture of a token
+  const look = (t: Token, patch: { rot?: number; flip?: boolean }) => {
+    const rot = patch.rot === undefined ? undefined : ((Math.round(patch.rot) % 360) + 360) % 360;
+    setTokens((all) =>
+      all[t.id] ? { ...all, [t.id]: { ...all[t.id], rot: rot ?? all[t.id].rot, flip: patch.flip ?? all[t.id].flip } } : all
+    );
+    socket.emit("setLook", { id: t.id, rot, flip: patch.flip });
   };
 
   // New tokens appear in the middle of the part of the map the GM can see
@@ -554,7 +586,7 @@ export default function Game({ init }: { init: Init }) {
     const s = snapPos(dims.current, newSize, cx - (newSize * CELL) / 2, cy - (newSize * CELL) / 2);
     socket.emit("addToken", {
       label: newLabel, color: newColor, size: newSize, ownerId: newOwner || null,
-      hp: newHp, maxHp: newHp, x: s.x, y: s.y,
+      hp: newHp, maxHp: newHp, x: s.x, y: s.y, hidden: newHidden,
     });
     setNewLabel("");
   };
@@ -631,6 +663,20 @@ export default function Game({ init }: { init: Init }) {
       </div>
     ) : null;
 
+  // Rotate and flip buttons (only for tokens that have a picture)
+  const lookControls = (t: Token) =>
+    t.image ? (
+      <div style={{ ...row, marginTop: 6 }}>
+        <button onClick={() => look(t, { rot: (t.rot ?? 0) - ROTATE_STEP })} title="Rotate left">↺</button>
+        <span style={{ fontSize: 12, minWidth: 36, textAlign: "center" }}>{t.rot ?? 0}°</span>
+        <button onClick={() => look(t, { rot: (t.rot ?? 0) + ROTATE_STEP })} title="Rotate right">↻</button>
+        <button onClick={() => look(t, { flip: !t.flip })}>Flip</button>
+        <button onClick={() => look(t, { rot: 0, flip: false })}>Reset</button>
+      </div>
+    ) : null;
+
+  const showInfo = (t: Token) => showNames || t.id === hoverId || t.id === selectedId;
+
   const show = (t: Tab): CSSProperties => ({ display: tab === t ? "block" : "none" });
   const cardStyle = (id: string): CSSProperties => ({
     border: id === selectedId ? "2px solid #f1c40f" : "1px solid #ddd",
@@ -650,6 +696,7 @@ export default function Game({ init }: { init: Init }) {
         onPointerMove={onMove}
         onPointerUp={onUp}
         onPointerCancel={onUp}
+        onPointerLeave={() => setHoverId(null)}
         onContextMenu={(e) => e.preventDefault()}
         style={{
           position: "absolute", inset: 0, overflow: "hidden", background: "#3a3a3a",
@@ -672,14 +719,15 @@ export default function Game({ init }: { init: Init }) {
               }}
             />
           )}
-          {Object.values(tokens).map((t) => (
+
+          {/* token pictures, drawn in layer order */}
+          {byLayer.map((t) => (
             <div
               key={t.id}
               data-token-id={t.id}
-              title={`${t.label} (${ownerName(t.ownerId)})`}
               style={{
                 position: "absolute", left: t.x, top: t.y, width: t.size * CELL, height: t.size * CELL,
-                cursor: canMove(t) ? "pointer" : "default",
+                zIndex: t.z ?? 0, opacity: t.hidden ? 0.45 : 1, cursor: canMove(t) ? "pointer" : "default",
               }}
             >
               <div
@@ -688,40 +736,53 @@ export default function Game({ init }: { init: Init }) {
                   background: t.image ? `url(${t.image}) center / cover no-repeat` : t.color,
                   border: t.image
                     ? "none"
-                    : `3px solid ${t.ownerId === null ? "#222" : t.ownerId === me.id ? "#f1c40f" : "#fff"}`,
+                    : `3px ${t.hidden ? "dashed" : "solid"} ${
+                        t.ownerId === null ? "#222" : t.ownerId === me.id ? "#f1c40f" : "#fff"
+                      }`,
+                  outline: t.hidden ? "2px dashed #fff" : "none",
+                  outlineOffset: 1,
+                  transform: t.image ? `rotate(${t.rot ?? 0}deg) scaleX(${t.flip ? -1 : 1})` : undefined,
+                  transition: "transform .15s",
                 }}
               />
-              <div
+            </div>
+          ))}
+
+          {/* names and HP bars: only for the hovered / selected token (or all, if chosen) */}
+          {byLayer.filter(showInfo).map((t) => (
+            <div
+              key={`info-${t.id}`}
+              style={{
+                position: "absolute", left: t.x + (t.size * CELL) / 2, top: t.y + t.size * CELL + 2,
+                transform: "translateX(-50%)", zIndex: 100000, pointerEvents: "none",
+                display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
+              }}
+            >
+              <span
                 style={{
-                  position: "absolute", top: "100%", left: "50%", transform: "translateX(-50%)", marginTop: 2,
-                  display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
+                  maxWidth: Math.max(t.size * CELL + 40, 80), overflow: "hidden", textOverflow: "ellipsis",
+                  whiteSpace: "nowrap", fontSize: 11, fontWeight: 600, color: "#222",
+                  background: "#ffffffcc", borderRadius: 4, padding: "0 4px",
                 }}
               >
-                <span
+                {t.label}
+                {t.hidden ? " (hidden)" : ""}
+              </span>
+              {t.hp !== undefined && t.maxHp !== undefined && (
+                <div
                   style={{
-                    maxWidth: Math.max(t.size * CELL + 40, 80), overflow: "hidden", textOverflow: "ellipsis",
-                    whiteSpace: "nowrap", fontSize: 11, fontWeight: 600, color: "#222",
-                    background: "#ffffffcc", borderRadius: 4, padding: "0 4px",
+                    width: Math.max(t.size * CELL, 40), height: 6, background: "#0005",
+                    border: "1px solid #0008", borderRadius: 3, boxSizing: "border-box", overflow: "hidden",
                   }}
                 >
-                  {t.label}
-                </span>
-                {t.hp !== undefined && t.maxHp !== undefined && (
                   <div
                     style={{
-                      width: Math.max(t.size * CELL, 40), height: 6, background: "#0005",
-                      border: "1px solid #0008", borderRadius: 3, boxSizing: "border-box", overflow: "hidden",
+                      width: `${clamp((t.hp / t.maxHp) * 100, 0, 100)}%`,
+                      height: "100%", background: hpColor(t),
                     }}
-                  >
-                    <div
-                      style={{
-                        width: `${clamp((t.hp / t.maxHp) * 100, 0, 100)}%`,
-                        height: "100%", background: hpColor(t),
-                      }}
-                    />
-                  </div>
-                )}
-              </div>
+                  />
+                </div>
+              )}
             </div>
           ))}
         </div>
@@ -782,11 +843,14 @@ export default function Game({ init }: { init: Init }) {
           <label style={{ display: "block", fontSize: 13 }}>
             <input type="checkbox" checked={showGrid} onChange={(e) => setShowGrid(e.target.checked)} /> Show grid
           </label>
+          <label style={{ display: "block", fontSize: 13 }}>
+            <input type="checkbox" checked={showNames} onChange={(e) => setShowNames(e.target.checked)} /> Show all names
+          </label>
           {!isGm && (
             <div style={{ ...row, marginTop: 10 }}>
               <button onClick={() => openTab("chat")}>Chat{unread > 0 ? ` (${unread})` : ""}</button>
               <button onClick={() => openTab("dice")}>Dice</button>
-              {mine && <button onClick={() => { setSelectedId(mine.id); openTab("token"); }}>My token</button>}
+              {mine && <button onClick={() => { setSelectedId(mine.id); openTab("token"); }}>My stats</button>}
             </div>
           )}
         </div>
@@ -901,6 +965,7 @@ export default function Game({ init }: { init: Init }) {
                         style={{
                           width: 44, height: 44, borderRadius: "50%", flex: "none", border: "2px solid #ddd",
                           background: t.image ? `url(${t.image}) center / cover no-repeat` : t.color,
+                          transform: t.image ? `rotate(${t.rot ?? 0}deg) scaleX(${t.flip ? -1 : 1})` : undefined,
                         }}
                       />
                       <div style={{ flex: 1 }}>
@@ -921,6 +986,7 @@ export default function Game({ init }: { init: Init }) {
                       / {t.maxHp}
                     </div>
                     {hpBar(t)}
+                    {lookControls(t)}
                   </div>
                 ))}
               </div>
@@ -960,6 +1026,12 @@ export default function Game({ init }: { init: Init }) {
                         type="number" min={1} max={9999} value={newHp} style={{ width: 60 }}
                         onChange={(e) => setNewHp(Number(e.target.value))}
                       />
+                    </label>
+                  </div>
+                  <div style={{ ...row, marginTop: 6 }}>
+                    <label style={{ fontSize: 13 }}>
+                      <input type="checkbox" checked={newHidden} onChange={(e) => setNewHidden(e.target.checked)} />{" "}
+                      Hidden from players
                     </label>
                     <button onClick={addToken}>Add</button>
                   </div>
@@ -1019,6 +1091,22 @@ export default function Game({ init }: { init: Init }) {
                       />
                     </div>
                     <div style={{ ...row, marginTop: 6 }}>
+                      <label style={{ fontSize: 13 }}>
+                        <input
+                          type="checkbox" checked={!!t.hidden}
+                          onChange={(e) => update(t.id, { hidden: e.target.checked })}
+                        />{" "}
+                        Hidden from players
+                      </label>
+                    </div>
+                    <div style={{ ...row, marginTop: 6 }}>
+                      <span style={{ fontSize: 13 }}>Layer</span>
+                      <button onClick={() => socket.emit("reorder", { id: t.id, op: "back" })}>Back</button>
+                      <button onClick={() => socket.emit("reorder", { id: t.id, op: "down" })} title="One step down">▼</button>
+                      <button onClick={() => socket.emit("reorder", { id: t.id, op: "up" })} title="One step up">▲</button>
+                      <button onClick={() => socket.emit("reorder", { id: t.id, op: "front" })}>Front</button>
+                    </div>
+                    <div style={{ ...row, marginTop: 6 }}>
                       <button
                         disabled={!!busy}
                         onClick={() => {
@@ -1030,6 +1118,7 @@ export default function Game({ init }: { init: Init }) {
                       </button>
                       {t.image && <button onClick={() => socket.emit("clearTokenImage", t.id)}>Remove image</button>}
                     </div>
+                    {lookControls(t)}
                   </div>
                 ))}
               </div>

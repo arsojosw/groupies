@@ -10,6 +10,7 @@ export type Account = {
 export type Token = {
   id: string; x: number; y: number; color: string; label: string;
   size: number; ownerId: string | null; hp: number; maxHp: number; image?: string;
+  rot?: number; flip?: boolean; hidden?: boolean; z?: number;
 };
 export type Roll = { formula: string; rolls: number[]; sides: number; total: number; keep?: boolean[] };
 export type Msg = {

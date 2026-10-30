@@ -4,6 +4,7 @@ export type Member = { id: string; name: string; role: Role };
 export type Token = {
   id: string; x: number; y: number; color: string; label: string;
   size: number; ownerId: string | null; hp?: number; maxHp?: number; image?: string;
+  rot?: number; flip?: boolean; hidden?: boolean; z?: number;
 };
 export type MapInfo = { image?: string; w: number; h: number };
 export type Roll = { formula: string; rolls: number[]; sides: number; total: number; keep?: boolean[] };
