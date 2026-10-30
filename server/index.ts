@@ -11,8 +11,8 @@ import type { Account, Campaign, Msg, Token } from "./store";
 const httpServer = createServer();
 const io = new Server(httpServer, { cors: { origin: "*" } });
 
-const MAP_W = 600;
-const MAP_H = 400;
+const MAP_W = 2000;
+const MAP_H = 2000;
 const CELL = 40;
 const MAX_TOKENS = 50;
 const COLORS = ["#378ADD", "#D85A30", "#2ecc71", "#f1c40f", "#9b59b6", "#1abc9c", "#e84393", "#e67e22"];
@@ -229,8 +229,9 @@ io.on("connection", (socket) => {
     const count = Object.keys(camp.tokens).length;
     if (count >= MAX_TOKENS) return;
     const id = randomUUID();
-    const pos = 20 + (count % 10) * 30;
-    camp.tokens[id] = clean({ ...raw, x: pos, y: pos }, id, camp);
+        const pos = 20 + (count % 10) * 30;
+    const hasPos = typeof raw.x === "number" && typeof raw.y === "number";
+    camp.tokens[id] = clean({ ...raw, x: hasPos ? raw.x : pos, y: hasPos ? raw.y : pos }, id, camp);
     save();
     emitToken(camp, "tokenAdded", camp.tokens[id]);
   });
