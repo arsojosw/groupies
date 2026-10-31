@@ -2,3 +2,4 @@
 dist
 server/data.json
 server/uploads/
+server/start-dev.ps1

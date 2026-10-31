@@ -81,6 +81,11 @@ export default function AuthScreen({ joinCode }: { joinCode: string | null }) {
             />
             <button disabled={busy} onClick={submitJoin}>Join</button>
             {error && <p style={red}>{error}</p>}
+            {mode === "register" && (
+              <p style={{ fontSize: 12, color: "#777" }}>
+                New accounts are activated by the administrator after payment is confirmed.
+              </p>
+            )}
           </>
         )}
         <p style={{ fontSize: 12, color: "#777" }}>

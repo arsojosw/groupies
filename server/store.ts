@@ -2,10 +2,12 @@ import { promises as fs } from "fs";
 import path from "path";
 import { randomBytes, createHash, scrypt, timingSafeEqual, randomUUID } from "crypto";
 
-export type Role = "gm" | "player";
+export type Role = "gm" | "player" | "admin";
 export type Account = {
   id: string; name: string; role: Role; campaignId: string;
-  username?: string; salt?: string; hash?: string; // only GM accounts have a password
+  username?: string; salt?: string; hash?: string; // GM and admin accounts have a password
+  paid?: boolean; // GM accounts only: false = cannot use the site
+  createdAt?: number; lastLoginAt?: number;
 };
 export type Token = {
   id: string; x: number; y: number; color: string; label: string;
@@ -45,9 +47,16 @@ export async function loadDb() {
   }
   const now = Date.now();
   for (const [k, s] of Object.entries(db.sessions)) if (s.expiresAt < now) delete db.sessions[k];
-   for (const c of Object.values(db.campaigns)) {
+  for (const c of Object.values(db.campaigns)) {
     c.map ??= { w: 2000, h: 2000 };
     c.assets ??= {};
+  }
+  // GM accounts created before the paid flag existed keep their access
+  for (const a of Object.values(db.accounts)) {
+    if (a.role === "gm") {
+      a.paid ??= true;
+      a.createdAt ??= now;
+    }
   }
 }
 
@@ -77,6 +86,10 @@ export function newSession(accountId: string) {
   return token;
 }
 
+function dropSessionsOf(accountId: string) {
+  for (const [k, s] of Object.entries(db.sessions)) if (s.accountId === accountId) delete db.sessions[k];
+}
+
 export function accountFromSession(token: unknown): Account | null {
   if (typeof token !== "string" || !token) return null;
   const s = db.sessions[sha(token)];
@@ -92,6 +105,7 @@ export function endSession(token: unknown) {
 
 const nameTaken = (u: string) => Object.values(db.accounts).some((a) => a.username === u);
 
+// New GM accounts start as NOT paid: the superadmin activates them
 export async function createGm(username: string, password: string, campaignName: string) {
   const uname = username.trim().toLowerCase();
   if (!/^[a-z0-9_]{3,20}$/.test(uname)) return { error: "Username: 3-20 letters, numbers or _" };
@@ -102,7 +116,10 @@ export async function createGm(username: string, password: string, campaignName:
   if (nameTaken(uname)) return { error: "Username already taken" };
   const accId = randomUUID();
   const campId = randomUUID();
-  db.accounts[accId] = { id: accId, name: uname, role: "gm", campaignId: campId, username: uname, salt, hash };
+  db.accounts[accId] = {
+    id: accId, name: uname, role: "gm", campaignId: campId, username: uname, salt, hash,
+    paid: false, createdAt: Date.now(),
+  };
   db.campaigns[campId] = {
     id: campId, name: campaignName.trim().slice(0, 40) || `${uname}'s table`,
     gmId: accId, memberIds: [], tokens: {}, messages: [], invites: [],
@@ -118,6 +135,36 @@ export async function checkLogin(username: string, password: string) {
   if (!acc?.hash) return null;
   const expected = Buffer.from(acc.hash, "hex");
   return key.length === expected.length && timingSafeEqual(key, expected) ? acc : null;
+}
+
+// The superadmin comes from the environment, never from the sign-up form
+export async function ensureAdmin(username: string, password: string): Promise<{ error?: string }> {
+  const uname = username.trim().toLowerCase();
+  if (!/^[a-z0-9_]{3,20}$/.test(uname)) return { error: "SUPERADMIN_USER must be 3-20 letters, numbers or _" };
+  if (password.length < 12) return { error: "SUPERADMIN_PASSWORD must be at least 12 characters" };
+  if (Object.values(db.accounts).some((a) => a.role !== "admin" && a.username === uname)) {
+    return { error: "SUPERADMIN_USER is already used by a GM account. Choose another name." };
+  }
+  // The environment is the source of truth: remove any other admin account
+  for (const a of Object.values(db.accounts)) {
+    if (a.role === "admin" && a.username !== uname) {
+      delete db.accounts[a.id];
+      dropSessionsOf(a.id);
+    }
+  }
+  let admin = Object.values(db.accounts).find((a) => a.role === "admin");
+  const salt = admin?.salt ?? randomBytes(16).toString("hex");
+  const hash = (await derive(password, salt)).toString("hex");
+  if (!admin) {
+    const id = randomUUID();
+    admin = { id, name: uname, role: "admin", campaignId: "", username: uname, salt, hash, createdAt: Date.now() };
+    db.accounts[id] = admin;
+  } else if (admin.hash !== hash) {
+    admin.hash = hash; // password changed: old sessions stop working
+    dropSessionsOf(admin.id);
+  }
+  save();
+  return {};
 }
 
 export function createPlayer(camp: Campaign, name: string) {

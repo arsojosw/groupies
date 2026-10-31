@@ -7,7 +7,7 @@ import { Server } from "socket.io";
 import type { Socket } from "socket.io";
 import {
   db, loadDb, save, newSession, accountFromSession, endSession,
-  createGm, checkLogin, createPlayer, activeInvites, findInvite,
+  createGm, checkLogin, createPlayer, ensureAdmin, activeInvites, findInvite,
 } from "./store";
 import type { Account, Campaign, Msg, Token } from "./store";
 
@@ -34,6 +34,9 @@ const acctRoom = (id: string) => `acct:${id}`;
 const everyone = (c: Campaign) => [gmRoom(c), playerRoom(c)];
 const assetUrl = (c: Campaign, file: string) => `/uploads/${c.id}/${file}`;
 
+// A table is usable only while its GM is marked as paid
+const isActive = (camp: Campaign) => db.accounts[camp.gmId]?.paid === true;
+
 // Simple per-connection rate limit
 function allow(socket: Socket, key: string, max: number, windowMs: number) {
   const rl: Record<string, number[]> = (socket.data.rl ??= {});
@@ -46,6 +49,23 @@ function allow(socket: Socket, key: string, max: number, windowMs: number) {
   hits.push(now);
   rl[key] = hits;
   return true;
+}
+
+// Failed sign-ins per username, so one account cannot be guessed at forever
+const failedLogins = new Map<string, number[]>();
+const FAIL_LIMIT = 8;
+const FAIL_WINDOW = 15 * 60_000;
+function recentFails(user: string) {
+  const now = Date.now();
+  const hits = (failedLogins.get(user) ?? []).filter((t) => now - t < FAIL_WINDOW);
+  failedLogins.set(user, hits);
+  return hits.length;
+}
+function noteFail(user: string) {
+  if (failedLogins.size > 5000) failedLogins.clear();
+  const hits = failedLogins.get(user) ?? [];
+  hits.push(Date.now());
+  failedLogins.set(user, hits);
 }
 
 // Validates everything coming from a browser before it is stored
@@ -190,6 +210,57 @@ function sniff(b: Buffer): "png" | "jpg" | "webp" | null {
   return null;
 }
 
+// ---------- superadmin ----------
+function gmRow(a: Account) {
+  const camp = db.campaigns[a.campaignId];
+  const rooms = io.sockets.adapter.rooms;
+  return {
+    id: a.id,
+    username: a.username ?? a.name,
+    campaign: camp?.name ?? "",
+    players: camp?.memberIds.length ?? 0,
+    online: camp ? (rooms.get(gmRoom(camp))?.size ?? 0) + (rooms.get(playerRoom(camp))?.size ?? 0) : 0,
+    paid: a.paid === true,
+    createdAt: a.createdAt ?? 0,
+    lastLoginAt: a.lastLoginAt ?? 0,
+    storage: camp ? Object.values(camp.assets).reduce((s, x) => s + x.size, 0) : 0,
+  };
+}
+
+const allGmRows = () => Object.values(db.accounts).filter((a) => a.role === "gm").map(gmRow);
+
+// Everyone connected to this GM's table is told and disconnected
+async function lockCampaign(gm: Account) {
+  const camp = db.campaigns[gm.campaignId];
+  if (!camp) return;
+  const sockets = await io.in(everyone(camp)).fetchSockets();
+  for (const s of sockets) {
+    s.emit("locked", { role: s.data.role ?? "player", campaign: camp.name });
+    s.disconnect(true);
+  }
+}
+
+function sendAdminInit(socket: Socket, acc: Account) {
+  socket.emit("adminInit", { me: { id: acc.id, name: acc.name }, gms: allGmRows() });
+}
+
+function setupAdmin(socket: Socket, acc: Account) {
+  socket.join("admin");
+  sendAdminInit(socket, acc);
+
+  socket.on("adminList", () => socket.emit("adminGms", allGmRows()));
+
+  socket.on("adminSetPaid", async (p: { id?: string; paid?: boolean }, cb?: Cb) => {
+    const gm = p?.id ? db.accounts[p.id] : undefined;
+    if (!gm || gm.role !== "gm") return cb?.({ error: "GM account not found" });
+    gm.paid = p.paid === true;
+    save();
+    if (!gm.paid) await lockCampaign(gm);
+    io.to("admin").emit("adminGm", gmRow(gm));
+    cb?.({ ok: true });
+  });
+}
+
 // ---------- image files ----------
 app.use(
   "/uploads",
@@ -204,10 +275,9 @@ app.use(
 app.post("/api/upload", express.raw({ type: () => true, limit: "6mb" }), async (req, res) => {
   try {
     const acc = accountFromSession((req.header("authorization") ?? "").replace(/^Bearer /, ""));
-    const camp = acc ? db.campaigns[acc.campaignId] : undefined;
-    if (!acc || !camp || acc.role !== "gm") {
-      return void res.status(403).json({ error: "Only the GM can upload images" });
-    }
+    const camp = acc && acc.role === "gm" ? db.campaigns[acc.campaignId] : undefined;
+    if (!acc || !camp) return void res.status(403).json({ error: "Only the GM can upload images" });
+    if (!isActive(camp)) return void res.status(403).json({ error: "Your account is not active" });
     const body: unknown = req.body;
     if (!Buffer.isBuffer(body) || body.length === 0) return void res.status(400).json({ error: "Empty upload" });
 
@@ -271,8 +341,7 @@ type Patch = {
 io.on("connection", (socket) => {
   const session = socket.handshake.auth?.session;
   const acc0 = accountFromSession(session);
-  const camp0 = acc0 ? db.campaigns[acc0.campaignId] : undefined;
-  const ctx = acc0 && camp0 ? { acc: acc0, camp: camp0 } : null;
+  const camp0 = acc0 && acc0.role !== "admin" ? db.campaigns[acc0.campaignId] : undefined;
 
   // ---------- available before signing in ----------
   socket.on("register", async (p: { username?: string; password?: string; campaignName?: string }, cb?: Cb) => {
@@ -280,14 +349,26 @@ io.on("connection", (socket) => {
     if (!allow(socket, "auth", 5, 60_000)) return cb({ error: "Too many attempts, wait a minute" });
     const res = await createGm(String(p?.username ?? ""), String(p?.password ?? ""), String(p?.campaignName ?? ""));
     if ("error" in res) return cb({ error: res.error });
+        res.account.lastLoginAt = Date.now();
+    io.to("admin").emit("adminGm", gmRow(res.account)); // shows up live in the admin list
     cb({ ok: true, session: newSession(res.account.id) });
   });
 
   socket.on("login", async (p: { username?: string; password?: string }, cb?: Cb) => {
     if (typeof cb !== "function") return;
     if (!allow(socket, "auth", 5, 60_000)) return cb({ error: "Too many attempts, wait a minute" });
-    const found = await checkLogin(String(p?.username ?? ""), String(p?.password ?? ""));
-    if (!found) return cb({ error: "Wrong username or password" });
+    const uname = String(p?.username ?? "").trim().toLowerCase();
+    if (recentFails(uname) >= FAIL_LIMIT) {
+      return cb({ error: "Too many failed attempts for this account. Try again in 15 minutes." });
+    }
+    const found = await checkLogin(uname, String(p?.password ?? ""));
+    if (!found) {
+      noteFail(uname);
+      return cb({ error: "Wrong username or password" });
+    }
+    failedLogins.delete(uname);
+    found.lastLoginAt = Date.now();
+    save();
     cb({ ok: true, session: newSession(found.id) });
   });
 
@@ -301,6 +382,8 @@ io.on("connection", (socket) => {
     const existing = accountFromSession(p?.session);
     if (existing && existing.campaignId === camp.id) return cb({ ok: true, session: p.session });
 
+    if (!isActive(camp)) return cb({ error: "This table is not active right now. Please ask your GM." });
+
     const name = String(p?.name ?? "").trim().slice(0, 20);
     if (!name) return cb({ needName: true, campaign: camp.name });
     if (camp.memberIds.length >= 20) return cb({ error: "This table is full" });
@@ -311,7 +394,7 @@ io.on("connection", (socket) => {
     const n = Object.keys(camp.tokens).length;
     camp.tokens[id] = clean(
       { label: name, color: COLORS[camp.memberIds.length % COLORS.length], ownerId: player.id,
-        x: 20 + (n % 10) * 30, y: 20 + (n % 10) * 30, hp: 10, maxHp: 10 },
+        x: 20 + (n % 10) * 30, y: 20 + (n % 10) * 30, hp: 10, maxHp: 10, z: nextZ(camp) },
       id, camp
     );
     save();
@@ -321,26 +404,40 @@ io.on("connection", (socket) => {
     cb({ ok: true, session: newSession(player.id) });
   });
 
-  socket.on("hello", () => {
-    if (ctx) sendInit(socket, ctx.acc, ctx.camp);
-    else socket.emit("unauth");
-  });
-
-  if (!ctx) {
-    socket.emit("unauth");
-    return;
-  }
-
-  // ---------- signed in ----------
-  const { acc, camp } = ctx;
-  const isGm = acc.role === "gm";
-  socket.join([acctRoom(acc.id), isGm ? gmRoom(camp) : playerRoom(camp)]);
-  sendInit(socket, acc, camp);
-
   socket.on("logout", (cb?: () => void) => {
     endSession(session);
     cb?.();
   });
+
+  socket.on("hello", () => {
+    if (acc0?.role === "admin") sendAdminInit(socket, acc0);
+    else if (acc0 && camp0) {
+      if (isActive(camp0)) sendInit(socket, acc0, camp0);
+      else socket.emit("locked", { role: acc0.role, campaign: camp0.name });
+    } else socket.emit("unauth");
+  });
+
+  // ---------- who is this? ----------
+  if (acc0?.role === "admin") {
+    setupAdmin(socket, acc0);
+    return;
+  }
+  if (!acc0 || !camp0) {
+    socket.emit("unauth");
+    return;
+  }
+  if (!isActive(camp0)) {
+    socket.emit("locked", { role: acc0.role, campaign: camp0.name });
+    return;
+  }
+
+  // ---------- signed in and active ----------
+  const acc = acc0;
+  const camp = camp0;
+  const isGm = acc.role === "gm";
+  socket.data.role = acc.role;
+  socket.join([acctRoom(acc.id), isGm ? gmRoom(camp) : playerRoom(camp)]);
+  sendInit(socket, acc, camp);
 
   // GM: invite links
   socket.on("createInvite", (p: { hours?: number; maxUses?: number }, cb?: Cb) => {
@@ -435,7 +532,8 @@ io.on("connection", (socket) => {
     gcAssets(camp);
     emitToken(camp, "tokenUpdated", t);
   });
-    // Rotate / flip the picture: the GM for any token, a player for their own
+
+  // Rotate / flip the picture: the GM for any token, a player for their own
   socket.on("setLook", (p: { id: string; rot?: number; flip?: boolean }) => {
     const t = camp.tokens[p?.id];
     if (!t || (!isGm && (t.ownerId !== acc.id || t.hidden))) return;
@@ -511,9 +609,17 @@ io.on("connection", (socket) => {
   });
 });
 
-loadDb().then(() =>
+loadDb().then(async () => {
+  const user = process.env.SUPERADMIN_USER;
+  const pass = process.env.SUPERADMIN_PASSWORD;
+  if (user && pass) {
+    const r = await ensureAdmin(user, pass);
+    console.log(r.error ? `Superadmin NOT created: ${r.error}` : `Superadmin ready: ${user}`);
+  } else {
+    console.log("No SUPERADMIN_USER / SUPERADMIN_PASSWORD set: the admin area is disabled");
+  }
   httpServer.listen(3001, () => {
     console.log("Server on http://localhost:3001");
-    console.log("Open http://localhost:5173/ to create a GM account");
-  })
-);
+    console.log("Open http://localhost:5173/ to sign in");
+  });
+});

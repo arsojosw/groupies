@@ -29,5 +29,10 @@ export function reconnectWith(session: string) {
 }
 
 export function signOut() {
-  socket.emit("logout", () => reconnectWith(""));
+  const finish = () => socket.emit("logout", () => reconnectWith(""));
+  if (socket.connected) finish();
+  else {
+    socket.once("connect", finish);
+    socket.connect();
+  }
 }

@@ -17,3 +17,9 @@ export type Init = {
   me: Me; campaign: { name: string }; map: MapInfo; members: Member[];
   tokens: Record<string, Token>; messages: Msg[]; invites?: Invite[];
 };
+export type GmRow = {
+  id: string; username: string; campaign: string; players: number; online: number;
+  paid: boolean; createdAt: number; lastLoginAt: number; storage: number;
+};
+export type AdminInit = { me: { id: string; name: string }; gms: GmRow[] };
+export type Locked = { role: Role; campaign: string };
