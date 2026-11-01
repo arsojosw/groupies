@@ -13,9 +13,9 @@ export default function LockedScreen({ info }: { info: Locked }) {
     <div style={box}>
       <h2 style={{ marginTop: 0 }}>{isGm ? "Account not active" : "Table not active"}</h2>
       {isGm ? (
-        <p>
-          Your GM account is not active yet. After the administrator confirms your payment, you can use the site.
-          Press "Check again" once you have been told it is activated.
+                <p>
+          Your GM account is not active. It is either waiting for activation or its paid period has ended.
+          Ask the administrator to activate or renew it, then press "Check again".
         </p>
       ) : (
         <p>

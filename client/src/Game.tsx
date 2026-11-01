@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ChangeEvent, CSSProperties, PointerEvent } from "react";
 import DiceBox from "@3d-dice/dice-box-threejs";
 import ChatPanel from "./ChatPanel";
+import ChangePassword from "./ChangePassword";
 import { prepareMap, prepareToken, upload } from "./imageUtils";
 import { signOut, socket } from "./socket";
 import { row } from "./styles";
@@ -44,6 +45,54 @@ const MAX_3D_DICE = 8;
 const floating: CSSProperties = {
   background: "#fff", border: "1px solid #bbb", borderRadius: 10, boxShadow: "0 6px 24px #0005",
 };
+const TAB_ICONS: Record<Tab, { src: string; label: string }> = {
+  token: { src: "/assets/user.webp", label: "My token" },
+  chat: { src: "/assets/chat.webp", label: "Chat" },
+  dice: { src: "/assets/dice.webp", label: "Dice" },
+  tokens: { src: "/assets/user.webp", label: "Tokens" },
+  map: { src: "/assets/map.webp", label: "Map" },
+  invite: { src: "/assets/invitelink.webp", label: "Invite players" },
+};
+
+// A tab shown as an icon only. The name appears as a tooltip.
+function IconTab({
+  id, variant, size, active, badge, onClick,
+}: {
+  id: Tab; variant: "tab" | "dock"; size: number; active?: boolean; badge?: number; onClick: () => void;
+}) {
+  const t = TAB_ICONS[id];
+  const base: CSSProperties = {
+    position: "relative", display: "inline-flex", alignItems: "center", justifyContent: "center",
+    padding: 0, cursor: "pointer",
+  };
+  const style: CSSProperties =
+    variant === "dock"
+      ? { ...base, ...floating, width: size + 20, height: size + 20, borderRadius: "50%" }
+      : {
+          ...base, width: size + 22, height: size + 16, border: "none",
+          borderBottom: `3px solid ${active ? "#222" : "transparent"}`,
+          borderRadius: "6px 6px 0 0", background: active ? "#ececec" : "transparent",
+        };
+  return (
+    <button onClick={onClick} title={t.label} aria-label={t.label} style={style}>
+      {/* multiply makes a white picture background see-through */}
+      <img
+        src={t.src} alt="" width={size} height={size} draggable={false}
+        style={{ display: "block", mixBlendMode: "multiply", pointerEvents: "none" }}
+      />
+      {badge ? (
+        <span
+          style={{
+            position: "absolute", top: 0, right: 0, background: "#e74c3c", color: "#fff", borderRadius: 9,
+            fontSize: 10, minWidth: 16, height: 16, lineHeight: "16px", textAlign: "center",
+          }}
+        >
+          {badge}
+        </span>
+      ) : null}
+    </button>
+  );
+}
 
 function loadFlag(key: string, fallback: boolean): boolean {
   try {
@@ -138,6 +187,7 @@ export default function Game({ init }: { init: Init }) {
   const [open, setOpen] = useState(isGm); // GM starts with the panel open, players with it closed
   const [tab, setTab] = useState<Tab>(isGm ? "tokens" : "token");
   const [menuOpen, setMenuOpen] = useState(false);
+    const [pwOpen, setPwOpen] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [hoverId, setHoverId] = useState<string | null>(null);
   const [unread, setUnread] = useState(0);
@@ -191,19 +241,7 @@ export default function Game({ init }: { init: Init }) {
     }
   };
 
-  const tabs: { id: Tab; label: string }[] = isGm
-    ? [
-        { id: "chat", label: "Chat" },
-        { id: "dice", label: "Dice" },
-        { id: "tokens", label: "Tokens" },
-        { id: "map", label: "Map" },
-        { id: "invite", label: "Invite" },
-      ]
-    : [
-        { id: "token", label: "Token" },
-        { id: "chat", label: "Chat" },
-        { id: "dice", label: "Dice" },
-      ];
+    const tabs: Tab[] = isGm ? ["chat", "dice", "tokens", "map", "invite"] : ["token", "chat", "dice"];
 
   useEffect(() => {
     chatVisible.current = open && tab === "chat";
@@ -638,6 +676,18 @@ export default function Game({ init }: { init: Init }) {
       setInviteError(r?.error ?? "")
     );
 
+  const removePlayer = (id: string, name: string) => {
+    if (
+      !window.confirm(
+        `Remove ${name} from the table?\n\nTheir token(s) stay on the map and go back to you. ` +
+          `To stop them joining again, also revoke the invite link they used.`
+      )
+    ) {
+      return;
+    }
+    socket.emit("removePlayer", { id });
+  };
+
   const hpColor = (t: Token) => {
     const pct = (t.hp ?? 0) / (t.maxHp || 1);
     return pct > 0.5 ? "#2ecc71" : pct > 0.25 ? "#f1c40f" : "#e74c3c";
@@ -846,11 +896,9 @@ export default function Game({ init }: { init: Init }) {
           <label style={{ display: "block", fontSize: 13 }}>
             <input type="checkbox" checked={showNames} onChange={(e) => setShowNames(e.target.checked)} /> Show all names
           </label>
-          {!isGm && (
-            <div style={{ ...row, marginTop: 10 }}>
-              <button onClick={() => openTab("chat")}>Chat{unread > 0 ? ` (${unread})` : ""}</button>
-              <button onClick={() => openTab("dice")}>Dice</button>
-              {mine && <button onClick={() => { setSelectedId(mine.id); openTab("token"); }}>My stats</button>}
+          {isGm && (
+            <div style={{ marginTop: 8 }}>
+              <button onClick={() => { setMenuOpen(false); setPwOpen(true); }}>Change password</button>
             </div>
           )}
         </div>
@@ -865,16 +913,10 @@ export default function Game({ init }: { init: Init }) {
           }}
         >
           {tabs.map((t) => (
-            <button
-              key={t.id}
-              onClick={() => openTab(t.id)}
-              style={{
-                ...floating, borderRadius: 16, padding: "6px 12px", cursor: "pointer", fontSize: 13,
-              }}
-            >
-              {t.label}
-              {t.id === "chat" && unread > 0 ? ` (${unread})` : ""}
-            </button>
+            <IconTab
+              key={t} id={t} variant="dock" size={24}
+              badge={t === "chat" ? unread : 0} onClick={() => openTab(t)}
+            />
           ))}
         </div>
       )}
@@ -921,20 +963,11 @@ export default function Game({ init }: { init: Init }) {
               borderBottom: "1px solid #ddd", flexWrap: "wrap",
             }}
           >
-            {tabs.map((t) => (
-              <button
-                key={t.id}
-                onClick={() => openTab(t.id)}
-                style={{
-                  border: "none", cursor: "pointer", fontSize: 13, padding: "6px 10px",
-                  borderRadius: "6px 6px 0 0",
-                  background: tab === t.id ? "#222" : "transparent",
-                  color: tab === t.id ? "#fff" : "#222",
-                }}
-              >
-                {t.label}
-                {t.id === "chat" && unread > 0 ? ` (${unread})` : ""}
-              </button>
+                        {tabs.map((t) => (
+              <IconTab
+                key={t} id={t} variant="tab" size={22} active={tab === t}
+                badge={t === "chat" ? unread : 0} onClick={() => openTab(t)}
+              />
             ))}
             <span style={{ flex: 1 }} />
             <button
@@ -1153,7 +1186,7 @@ export default function Game({ init }: { init: Init }) {
               </div>
             )}
 
-            {/* GM: invite links */}
+            {/* GM: invite links and players */}
             {isGm && (
               <div style={show("invite")}>
                 <div style={row}>
@@ -1172,24 +1205,63 @@ export default function Game({ init }: { init: Init }) {
                   <button onClick={createInvite}>Create link</button>
                 </div>
                 {inviteError && <div style={{ color: "#c0392b", fontSize: 13, marginTop: 4 }}>{inviteError}</div>}
-                {invites.filter((i) => i.expiresAt > Date.now()).map((i) => (
-                  <div key={i.code} style={{ marginTop: 10 }}>
-                    <div style={row}>
-                      <input readOnly value={inviteLink(i.code)} style={{ flex: 1, minWidth: 120 }} />
-                      <button onClick={() => navigator.clipboard.writeText(inviteLink(i.code))}>Copy</button>
-                      <button onClick={() => socket.emit("revokeInvite", i.code)}>Revoke</button>
+
+                {[...invites].reverse().map((i) => {
+                  const usable = i.expiresAt > Date.now() && i.uses < i.maxUses;
+                  const state = usable ? "Active" : i.uses >= i.maxUses ? "Full" : "Expired";
+                  const joined = i.usedBy ?? [];
+                  return (
+                    <div key={i.code} style={{ marginTop: 10, opacity: usable ? 1 : 0.7 }}>
+                      <div style={row}>
+                        <input readOnly value={inviteLink(i.code)} style={{ flex: 1, minWidth: 120 }} />
+                        {usable && (
+                          <button onClick={() => navigator.clipboard.writeText(inviteLink(i.code))}>Copy</button>
+                        )}
+                        <button onClick={() => socket.emit("revokeInvite", i.code)}>{usable ? "Revoke" : "Remove"}</button>
+                      </div>
+                      <div style={{ fontSize: 11, color: "#777" }}>
+                        {state} · used {i.uses}/{i.maxUses} · expires {new Date(i.expiresAt).toLocaleString()}
+                      </div>
+                      {joined.length > 0 && (
+                        <div style={{ fontSize: 12, marginTop: 2 }}>
+                          Joined:{" "}
+                          {joined.map((u, idx) => {
+                            const gone = !members.some((m) => m.id === u.id);
+                            return (
+                              <span key={u.id} title={new Date(u.ts).toLocaleString()}>
+                                {idx > 0 ? ", " : ""}
+                                <span style={gone ? { textDecoration: "line-through", color: "#999" } : undefined}>
+                                  {u.name}
+                                  {gone ? " (removed)" : ""}
+                                </span>
+                              </span>
+                            );
+                          })}
+                        </div>
+                      )}
                     </div>
-                    <div style={{ fontSize: 11, color: "#777" }}>
-                      Used {i.uses}/{i.maxUses}. Expires {new Date(i.expiresAt).toLocaleString()}
+                  );
+                })}
+
+                <div style={{ marginTop: 18, fontWeight: 600 }}>Players ({players.length})</div>
+                {players.length === 0 && <div style={{ color: "#777", fontSize: 13 }}>Nobody has joined yet.</div>}
+                {players.map((p) => {
+                  const own = Object.values(tokens).filter((t) => t.ownerId === p.id).length;
+                  return (
+                    <div key={p.id} style={{ ...row, borderTop: "1px solid #eee", marginTop: 6, paddingTop: 6 }}>
+                      <span style={{ flex: 1 }}>{p.name}</span>
+                      <span style={{ fontSize: 12, color: "#777" }}>{own} token{own === 1 ? "" : "s"}</span>
+                      <button onClick={() => removePlayer(p.id, p.name)}>Remove</button>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
         </div>
       )}
 
+      {pwOpen && <ChangePassword onClose={() => setPwOpen(false)} />}
       {/* hidden file pickers (GM) */}
       {isGm && (
         <>

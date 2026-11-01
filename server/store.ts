@@ -7,6 +7,7 @@ export type Account = {
   id: string; name: string; role: Role; campaignId: string;
   username?: string; salt?: string; hash?: string; // GM and admin accounts have a password
   paid?: boolean; // GM accounts only: false = cannot use the site
+  paidUntil?: number; // GM accounts: access ends at this time (empty = no end date)
   createdAt?: number; lastLoginAt?: number;
 };
 export type Token = {
@@ -19,7 +20,10 @@ export type Msg = {
   id: string; ts: number; fromId: string; fromName: string;
   to: string[] | null; kind: "text" | "roll"; text?: string; roll?: Roll;
 };
-export type Invite = { code: string; expiresAt: number; maxUses: number; uses: number };
+export type Invite = {
+  code: string; expiresAt: number; maxUses: number; uses: number;
+  usedBy?: { id: string; name: string; ts: number }[];
+};
 export type MapInfo = { image?: string; w: number; h: number };
 export type Asset = { file: string; size: number };
 export type Campaign = {
@@ -27,14 +31,16 @@ export type Campaign = {
   tokens: Record<string, Token>; messages: Msg[]; invites: Invite[];
   map: MapInfo; assets: Record<string, Asset>;
 };
+export type LogEntry = { id: string; ts: number; actor: string; action: string; target?: string; detail?: string };
 type DB = {
   accounts: Record<string, Account>;
   sessions: Record<string, { accountId: string; expiresAt: number }>;
   campaigns: Record<string, Campaign>;
+  log: LogEntry[];
 };
 
 const FILE = path.join(process.cwd(), "data.json");
-export const db: DB = { accounts: {}, sessions: {}, campaigns: {} };
+export const db: DB = { accounts: {}, sessions: {}, campaigns: {}, log: [] };
 
 export async function loadDb() {
   try {
@@ -45,6 +51,7 @@ export async function loadDb() {
       process.exit(1);
     }
   }
+  db.log ??= [];
   const now = Date.now();
   for (const [k, s] of Object.entries(db.sessions)) if (s.expiresAt < now) delete db.sessions[k];
   for (const c of Object.values(db.campaigns)) {
@@ -74,6 +81,15 @@ export function save() {
   }, 300);
 }
 
+// ---------- activity log ----------
+export function logEvent(actor: string, action: string, target?: string, detail?: string): LogEntry {
+  const entry: LogEntry = { id: randomUUID(), ts: Date.now(), actor, action, target, detail };
+  db.log.push(entry);
+  if (db.log.length > 2000) db.log.splice(0, db.log.length - 2000);
+  save();
+  return entry;
+}
+
 // ---------- sessions and passwords ----------
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const derive = (pw: string, salt: string) =>
@@ -90,6 +106,12 @@ function dropSessionsOf(accountId: string) {
   for (const [k, s] of Object.entries(db.sessions)) if (s.accountId === accountId) delete db.sessions[k];
 }
 
+// After accounts are deleted, remove sessions that point to nobody
+export function purgeOrphanSessions() {
+  for (const [k, s] of Object.entries(db.sessions)) if (!db.accounts[s.accountId]) delete db.sessions[k];
+  save();
+}
+
 export function accountFromSession(token: unknown): Account | null {
   if (typeof token !== "string" || !token) return null;
   const s = db.sessions[sha(token)];
@@ -100,6 +122,15 @@ export function accountFromSession(token: unknown): Account | null {
 export function endSession(token: unknown) {
   if (typeof token !== "string") return;
   delete db.sessions[sha(token)];
+  save();
+}
+
+// New password for an account; every existing session of that account stops working
+export async function setPassword(acc: Account, password: string) {
+  const salt = randomBytes(16).toString("hex");
+  acc.salt = salt;
+  acc.hash = (await derive(password, salt)).toString("hex");
+  dropSessionsOf(acc.id);
   save();
 }
 
@@ -176,17 +207,15 @@ export function createPlayer(camp: Campaign, name: string) {
 }
 
 // ---------- invites ----------
+// Invites that can still be used
 export function activeInvites(camp: Campaign) {
   const now = Date.now();
-  camp.invites = camp.invites.filter((i) => i.expiresAt > now && i.uses < i.maxUses);
-  return camp.invites;
+  return camp.invites.filter((i) => i.expiresAt > now && i.uses < i.maxUses);
 }
 
-export function findInvite(code: unknown) {
-  if (typeof code !== "string") return null;
-  for (const camp of Object.values(db.campaigns)) {
-    const inv = activeInvites(camp).find((i) => i.code === code);
-    if (inv) return { camp, inv };
-  }
-  return null;
+// Invites shown to the GM: usable ones, plus finished ones from the last 30 days (they show who joined)
+export function listInvites(camp: Campaign) {
+  const cutoff = Date.now() - 30 * 24 * 3600 * 1000;
+  camp.invites = camp.invites.filter((i) => i.expiresAt > cutoff);
+  return camp.invites;
 }

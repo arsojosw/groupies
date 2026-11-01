@@ -7,7 +7,8 @@ import { Server } from "socket.io";
 import type { Socket } from "socket.io";
 import {
   db, loadDb, save, newSession, accountFromSession, endSession,
-  createGm, checkLogin, createPlayer, ensureAdmin, activeInvites, findInvite,
+  createGm, checkLogin, createPlayer, ensureAdmin, activeInvites, listInvites, findInvite,
+  setPassword, purgeOrphanSessions, logEvent,
 } from "./store";
 import type { Account, Campaign, Msg, Token } from "./store";
 
@@ -34,8 +35,28 @@ const acctRoom = (id: string) => `acct:${id}`;
 const everyone = (c: Campaign) => [gmRoom(c), playerRoom(c)];
 const assetUrl = (c: Campaign, file: string) => `/uploads/${c.id}/${file}`;
 
-// A table is usable only while its GM is marked as paid
-const isActive = (camp: Campaign) => db.accounts[camp.gmId]?.paid === true;
+// Writes to the activity log and shows the entry live in the admin page
+function record(actor: string, action: string, target?: string, detail?: string) {
+  io.to("admin").emit("adminLog", logEvent(actor, action, target, detail));
+}
+
+// A GM whose paid period has ended becomes "not paid"
+function checkExpiry(gm: Account): boolean {
+  if (gm.role !== "gm" || gm.paid !== true || gm.paidUntil === undefined || gm.paidUntil > Date.now()) return false;
+  gm.paid = false;
+  save();
+  record("system", "gm.expired", gm.username, `Paid period ended ${new Date(gm.paidUntil).toLocaleDateString()}`);
+  io.to("admin").emit("adminGm", gmRow(gm));
+  return true;
+}
+
+// A table is usable only while its GM is paid and the paid period has not ended
+const isActive = (camp: Campaign) => {
+  const gm = db.accounts[camp.gmId];
+  if (!gm) return false;
+  checkExpiry(gm);
+  return gm.paid === true;
+};
 
 // Simple per-connection rate limit
 function allow(socket: Socket, key: string, max: number, windowMs: number) {
@@ -171,7 +192,7 @@ function sendInit(socket: Socket, acc: Account, camp: Campaign) {
     members: membersOf(camp),
     tokens: tokensFor(camp, acc),
     messages: camp.messages.filter((m) => canSee(m, acc.id)).slice(-50),
-    invites: acc.role === "gm" ? activeInvites(camp) : undefined,
+     invites: acc.role === "gm" ? listInvites(camp) : undefined,
   });
 }
 
@@ -211,6 +232,20 @@ function sniff(b: Buffer): "png" | "jpg" | "webp" | null {
 }
 
 // ---------- superadmin ----------
+const MONTH_CHOICES = [1, 3, 6, 12];
+const fmtDate = (t: number) => new Date(t).toLocaleDateString();
+
+// Add whole months, keeping the day of month where possible (31 Jan + 1 month = 28/29 Feb)
+function addMonths(ts: number, months: number) {
+  const d = new Date(ts);
+  const day = d.getDate();
+  d.setDate(1);
+  d.setMonth(d.getMonth() + months);
+  const last = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+  d.setDate(Math.min(day, last));
+  return d.getTime();
+}
+
 function gmRow(a: Account) {
   const camp = db.campaigns[a.campaignId];
   const rooms = io.sockets.adapter.rooms;
@@ -221,13 +256,18 @@ function gmRow(a: Account) {
     players: camp?.memberIds.length ?? 0,
     online: camp ? (rooms.get(gmRoom(camp))?.size ?? 0) + (rooms.get(playerRoom(camp))?.size ?? 0) : 0,
     paid: a.paid === true,
+    paidUntil: a.paidUntil ?? null,
     createdAt: a.createdAt ?? 0,
     lastLoginAt: a.lastLoginAt ?? 0,
     storage: camp ? Object.values(camp.assets).reduce((s, x) => s + x.size, 0) : 0,
   };
 }
 
-const allGmRows = () => Object.values(db.accounts).filter((a) => a.role === "gm").map(gmRow);
+const allGmRows = () => {
+  const gms = Object.values(db.accounts).filter((a) => a.role === "gm");
+  gms.forEach((gm) => checkExpiry(gm));
+  return gms.map(gmRow);
+};
 
 // Everyone connected to this GM's table is told and disconnected
 async function lockCampaign(gm: Account) {
@@ -240,8 +280,38 @@ async function lockCampaign(gm: Account) {
   }
 }
 
+// Sign the GM out of every open window (their players stay connected)
+async function kickGm(camp: Campaign) {
+  const sockets = await io.in(gmRoom(camp)).fetchSockets();
+  for (const s of sockets) {
+    s.emit("unauth");
+    s.disconnect(true);
+  }
+}
+
+// Remove a GM, their table, their players and all uploaded images
+async function deleteGm(gm: Account) {
+  const camp = db.campaigns[gm.campaignId];
+  if (camp) {
+    const sockets = await io.in(everyone(camp)).fetchSockets();
+    for (const s of sockets) {
+      s.emit("unauth");
+      s.disconnect(true);
+    }
+    for (const id of camp.memberIds) delete db.accounts[id];
+    delete db.campaigns[camp.id];
+    await fsp.rm(path.join(UPLOAD_DIR, camp.id), { recursive: true, force: true }).catch(() => {});
+  }
+  delete db.accounts[gm.id];
+  purgeOrphanSessions();
+}
+
 function sendAdminInit(socket: Socket, acc: Account) {
-  socket.emit("adminInit", { me: { id: acc.id, name: acc.name }, gms: allGmRows() });
+  socket.emit("adminInit", {
+    me: { id: acc.id, name: acc.name },
+    gms: allGmRows(),
+    log: db.log.slice(-300),
+  });
 }
 
 function setupAdmin(socket: Socket, acc: Account) {
@@ -249,14 +319,67 @@ function setupAdmin(socket: Socket, acc: Account) {
   sendAdminInit(socket, acc);
 
   socket.on("adminList", () => socket.emit("adminGms", allGmRows()));
+  socket.on("adminLogList", () => socket.emit("adminLogs", db.log.slice(-500)));
 
-  socket.on("adminSetPaid", async (p: { id?: string; paid?: boolean }, cb?: Cb) => {
-    const gm = p?.id ? db.accounts[p.id] : undefined;
-    if (!gm || gm.role !== "gm") return cb?.({ error: "GM account not found" });
-    gm.paid = p.paid === true;
-    save();
-    if (!gm.paid) await lockCampaign(gm);
+  const findGm = (id: unknown) => {
+    const gm = typeof id === "string" ? db.accounts[id] : undefined;
+    return gm && gm.role === "gm" ? gm : undefined;
+  };
+
+  // Mark paid for 1, 3, 6 or 12 months (months = null: no end date), or mark unpaid
+  socket.on("adminSetPaid", async (p: { id?: string; paid?: boolean; months?: number | null }, cb?: Cb) => {
+    const gm = findGm(p?.id);
+    if (!gm) return cb?.({ error: "GM account not found" });
+    if (p.paid === true) {
+      const months = p.months === null || p.months === undefined ? null : Number(p.months);
+      if (months !== null && !MONTH_CHOICES.includes(months)) return cb?.({ error: "Choose 1, 3, 6 or 12 months" });
+      let detail = "No end date";
+      if (months === null) {
+        gm.paidUntil = undefined;
+      } else {
+        // Renewing early adds time on top of the current end date; otherwise it starts now
+        const base =
+          gm.paid === true && gm.paidUntil !== undefined && gm.paidUntil > Date.now() ? gm.paidUntil : Date.now();
+        gm.paidUntil = addMonths(base, months);
+        detail = `${months} month${months > 1 ? "s" : ""}, until ${fmtDate(gm.paidUntil)}`;
+      }
+      gm.paid = true;
+      save();
+      record(acc.name, "gm.paid", gm.username, detail);
+    } else {
+      gm.paid = false;
+      gm.paidUntil = undefined;
+      save();
+      record(acc.name, "gm.unpaid", gm.username);
+      await lockCampaign(gm);
+    }
     io.to("admin").emit("adminGm", gmRow(gm));
+    cb?.({ ok: true });
+  });
+
+  // New random password, shown to the admin once
+  socket.on("adminResetPassword", async (p: { id?: string }, cb?: Cb) => {
+    const gm = findGm(p?.id);
+    if (!gm) return cb?.({ error: "GM account not found" });
+    const temp = randomBytes(9).toString("base64url");
+    await setPassword(gm, temp);
+    failedLogins.delete(gm.username ?? "");
+    const camp = db.campaigns[gm.campaignId];
+    if (camp) await kickGm(camp);
+    record(acc.name, "gm.password_reset", gm.username);
+    cb?.({ ok: true, password: temp });
+  });
+
+  socket.on("adminDeleteGm", async (p: { id?: string; confirm?: string }, cb?: Cb) => {
+    const gm = findGm(p?.id);
+    if (!gm) return cb?.({ error: "GM account not found" });
+    if (String(p.confirm ?? "").trim().toLowerCase() !== gm.username) {
+      return cb?.({ error: "The typed username does not match" });
+    }
+    const players = db.campaigns[gm.campaignId]?.memberIds.length ?? 0;
+    await deleteGm(gm);
+    record(acc.name, "gm.deleted", gm.username, `Table and ${players} player account(s) removed`);
+    io.to("admin").emit("adminGmRemoved", gm.id);
     cb?.({ ok: true });
   });
 }
@@ -348,9 +471,10 @@ io.on("connection", (socket) => {
     if (typeof cb !== "function") return;
     if (!allow(socket, "auth", 5, 60_000)) return cb({ error: "Too many attempts, wait a minute" });
     const res = await createGm(String(p?.username ?? ""), String(p?.password ?? ""), String(p?.campaignName ?? ""));
-    if ("error" in res) return cb({ error: res.error });
-        res.account.lastLoginAt = Date.now();
-    io.to("admin").emit("adminGm", gmRow(res.account)); // shows up live in the admin list
+        if ("error" in res) return cb({ error: res.error });
+    res.account.lastLoginAt = Date.now();
+    record(res.account.name, "gm.registered", res.account.name, `Table: ${db.campaigns[res.account.campaignId]?.name ?? ""}`);
+    io.to("admin").emit("adminGm", gmRow(res.account));
     cb({ ok: true, session: newSession(res.account.id) });
   });
 
@@ -362,12 +486,16 @@ io.on("connection", (socket) => {
       return cb({ error: "Too many failed attempts for this account. Try again in 15 minutes." });
     }
     const found = await checkLogin(uname, String(p?.password ?? ""));
-    if (!found) {
+        if (!found) {
       noteFail(uname);
+      if (recentFails(uname) === FAIL_LIMIT) {
+        record("system", "login.lockout", uname, "Too many failed sign-ins: blocked for 15 minutes");
+      }
       return cb({ error: "Wrong username or password" });
     }
     failedLogins.delete(uname);
     found.lastLoginAt = Date.now();
+    if (found.role === "admin") record(found.name, "admin.login");
     save();
     cb({ ok: true, session: newSession(found.id) });
   });
@@ -390,6 +518,7 @@ io.on("connection", (socket) => {
 
     inv.uses += 1;
     const player = createPlayer(camp, name);
+    (inv.usedBy ??= []).push({ id: player.id, name: player.name, ts: Date.now() });
     const id = randomUUID();
     const n = Object.keys(camp.tokens).length;
     camp.tokens[id] = clean(
@@ -400,7 +529,7 @@ io.on("connection", (socket) => {
     save();
     emitToken(camp, "tokenAdded", camp.tokens[id]);
     io.to(everyone(camp)).emit("members", membersOf(camp));
-    io.to(gmRoom(camp)).emit("invites", activeInvites(camp));
+        io.to(gmRoom(camp)).emit("invites", listInvites(camp));
     cb({ ok: true, session: newSession(player.id) });
   });
 
@@ -439,6 +568,18 @@ io.on("connection", (socket) => {
   socket.join([acctRoom(acc.id), isGm ? gmRoom(camp) : playerRoom(camp)]);
   sendInit(socket, acc, camp);
 
+    // GM: change own password (the current session stays valid, other devices are signed out)
+  socket.on("changePassword", async (p: { current?: string; next?: string }, cb?: Cb) => {
+    if (!isGm || typeof cb !== "function") return;
+    if (!allow(socket, "pw", 5, 60_000)) return cb({ error: "Too many attempts, wait a minute" });
+    const next = String(p?.next ?? "");
+    if (next.length < 8 || next.length > 100) return cb({ error: "New password must be 8-100 characters" });
+    const ok = await checkLogin(acc.username ?? "", String(p?.current ?? ""));
+    if (!ok || ok.id !== acc.id) return cb({ error: "Current password is wrong" });
+    await setPassword(acc, next);
+    record(acc.name, "gm.password_changed", acc.username);
+    cb({ ok: true, session: newSession(acc.id) });
+  });
   // GM: invite links
   socket.on("createInvite", (p: { hours?: number; maxUses?: number }, cb?: Cb) => {
     if (!isGm) return;
@@ -447,7 +588,7 @@ io.on("connection", (socket) => {
     if (activeInvites(camp).length >= 10) return cb?.({ error: "Too many active links. Revoke one first." });
     camp.invites.push({ code: randomBytes(9).toString("base64url"), expiresAt: Date.now() + hours * 3_600_000, maxUses, uses: 0 });
     save();
-    io.to(gmRoom(camp)).emit("invites", camp.invites);
+        io.to(gmRoom(camp)).emit("invites", listInvites(camp));
     cb?.({ ok: true });
   });
 
@@ -455,9 +596,33 @@ io.on("connection", (socket) => {
     if (!isGm) return;
     camp.invites = camp.invites.filter((i) => i.code !== code);
     save();
-    io.to(gmRoom(camp)).emit("invites", activeInvites(camp));
+        io.to(gmRoom(camp)).emit("invites", listInvites(camp));
   });
 
+    // GM: remove a player. Their tokens stay on the map and go back to the GM.
+  socket.on("removePlayer", async (p: { id?: string }) => {
+    if (!isGm || typeof p?.id !== "string" || !camp.memberIds.includes(p.id)) return;
+    const id = p.id;
+    const playerName = db.accounts[id]?.name ?? "?";
+    camp.memberIds = camp.memberIds.filter((m) => m !== id);
+    for (const t of Object.values(camp.tokens)) {
+      if (t.ownerId === id) {
+        t.ownerId = null;
+        emitToken(camp, "tokenUpdated", t); // players now see it as a GM token
+      }
+    }
+    delete db.accounts[id];
+    purgeOrphanSessions();
+    save();
+    // Sign the player out of every open window
+    const sockets = await io.in(acctRoom(id)).fetchSockets();
+    for (const s of sockets) {
+      s.emit("unauth");
+      s.disconnect(true);
+    }
+    io.to(everyone(camp)).emit("members", membersOf(camp));
+    record(acc.name, "player.removed", acc.name, `Removed player ${playerName}`);
+  });
   // GM: map settings (the image itself arrives through /api/upload)
   socket.on("setMap", (p: { w?: number; h?: number }) => {
     if (!isGm || !p) return;
@@ -618,6 +783,12 @@ loadDb().then(async () => {
   } else {
     console.log("No SUPERADMIN_USER / SUPERADMIN_PASSWORD set: the admin area is disabled");
   }
+  // Every minute: switch off GMs whose paid period has ended, even if they are online
+  setInterval(() => {
+    for (const gm of Object.values(db.accounts)) {
+      if (checkExpiry(gm)) void lockCampaign(gm);
+    }
+  }, 60_000);
   httpServer.listen(3001, () => {
     console.log("Server on http://localhost:3001");
     console.log("Open http://localhost:5173/ to sign in");

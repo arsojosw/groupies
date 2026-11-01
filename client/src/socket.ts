@@ -36,3 +36,8 @@ export function signOut() {
     socket.connect();
   }
 }
+// Keep the new session after a password change without reconnecting
+export function updateSession(session: string) {
+  storeSession(session);
+  socket.auth = { session };
+}

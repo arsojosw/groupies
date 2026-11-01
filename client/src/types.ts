@@ -12,14 +12,18 @@ export type Msg = {
   id: string; ts: number; fromId: string; fromName: string;
   to: string[] | null; kind: "text" | "roll"; text?: string; roll?: Roll;
 };
-export type Invite = { code: string; expiresAt: number; uses: number; maxUses: number };
+export type Invite = {
+  code: string; expiresAt: number; uses: number; maxUses: number;
+  usedBy?: { id: string; name: string; ts: number }[];
+};
 export type Init = {
   me: Me; campaign: { name: string }; map: MapInfo; members: Member[];
   tokens: Record<string, Token>; messages: Msg[]; invites?: Invite[];
 };
 export type GmRow = {
   id: string; username: string; campaign: string; players: number; online: number;
-  paid: boolean; createdAt: number; lastLoginAt: number; storage: number;
+  paid: boolean; paidUntil: number | null; createdAt: number; lastLoginAt: number; storage: number;
 };
-export type AdminInit = { me: { id: string; name: string }; gms: GmRow[] };
+export type LogEntry = { id: string; ts: number; actor: string; action: string; target?: string; detail?: string };
+export type AdminInit = { me: { id: string; name: string }; gms: GmRow[]; log: LogEntry[] };
 export type Locked = { role: Role; campaign: string };
