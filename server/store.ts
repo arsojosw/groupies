@@ -18,7 +18,7 @@ export type Token = {
 export type Roll = { formula: string; rolls: number[]; sides: number; total: number; keep?: boolean[] };
 export type Msg = {
   id: string; ts: number; fromId: string; fromName: string;
-  to: string[] | null; kind: "text" | "roll"; text?: string; roll?: Roll;
+  to: string[] | null; kind: "text" | "roll" | "action"; text?: string; roll?: Roll;
 };
 export type Invite = {
   code: string; expiresAt: number; maxUses: number; uses: number;
@@ -218,4 +218,12 @@ export function listInvites(camp: Campaign) {
   const cutoff = Date.now() - 30 * 24 * 3600 * 1000;
   camp.invites = camp.invites.filter((i) => i.expiresAt > cutoff);
   return camp.invites;
+}
+export function findInvite(code: unknown) {
+  if (typeof code !== "string") return null;
+  for (const camp of Object.values(db.campaigns)) {
+    const inv = activeInvites(camp).find((i) => i.code === code);
+    if (inv) return { camp, inv };
+  }
+  return null;
 }

@@ -25,6 +25,9 @@ const MAX_TOKEN_BYTES = 2 * 1024 * 1024;
 const QUOTA_BYTES = 50 * 1024 * 1024; // per table
 const UPLOAD_DIR = path.join(process.cwd(), "uploads");
 const COLORS = ["#378ADD", "#D85A30", "#2ecc71", "#f1c40f", "#9b59b6", "#1abc9c", "#e84393", "#e67e22"];
+// Token actions (the buttons that appear when a token is selected)
+const ACTION_LABELS: Record<string, string> = { sword: "Melee Attack" };
+const MELEE_STOP_AT_CONTACT = true; // the source stops where its edge touches the edge of the target
 
 type Cb = (res: Record<string, unknown>) => void;
 
@@ -754,6 +757,47 @@ io.on("connection", (socket) => {
     save();
     // Moves of hidden tokens are only sent to the GM
     socket.to(t.hidden ? [gmRoom(camp)] : everyone(camp)).emit("moved", { id, x: t.x, y: t.y });
+  });
+
+  // A token uses an action on another token. For now: Melee Attack = glide to the target.
+  socket.on("tokenAction", (p: { from?: string; to?: string; action?: string }) => {
+    if (!allow(socket, "act", 10, 10_000)) return;
+    const label = p?.action ? ACTION_LABELS[p.action] : undefined;
+    const src = typeof p?.from === "string" ? camp.tokens[p.from] : undefined;
+    const dst = typeof p?.to === "string" ? camp.tokens[p.to] : undefined;
+    if (!label || !src || !dst || src.id === dst.id) return;
+    // The GM may use any token. A player: only their own, and only against tokens they can see.
+    if (!isGm && (src.ownerId !== acc.id || src.hidden || dst.hidden)) return;
+
+    // Straight line: the middle of the source token goes to the middle of the target token
+    const sSize = src.size * CELL;
+    const dSize = dst.size * CELL;
+    const sc = { x: src.x + sSize / 2, y: src.y + sSize / 2 };
+    const dc = { x: dst.x + dSize / 2, y: dst.y + dSize / 2 };
+    let goal = dc;
+    if (MELEE_STOP_AT_CONTACT) {
+      const dist = Math.hypot(dc.x - sc.x, dc.y - sc.y);
+      const contact = (sSize + dSize) / 2;
+      goal = dist <= contact
+        ? sc // already touching: stay
+        : { x: dc.x - ((dc.x - sc.x) / dist) * contact, y: dc.y - ((dc.y - sc.y) / dist) * contact };
+    }
+        const x = clamp(goal.x - sSize / 2, 0, camp.map.w - sSize);
+    const y = clamp(goal.y - sSize / 2, 0, camp.map.h - sSize);
+    const moved = Math.hypot(x - src.x, y - src.y);
+    const ms = Math.round(clamp(350 + moved * 1.2, 400, 1500));
+    src.x = x;
+    src.y = y;
+    save();
+
+    // If a hidden token is involved, only the GM sees the move and the chat line
+    const secret = !!src.hidden || !!dst.hidden;
+    if (moved >= 1) io.to(secret ? [gmRoom(camp)] : everyone(camp)).emit("tween", { id: src.id, x, y, ms });
+    postMsg(camp, acc, {
+      to: secret ? [camp.gmId] : null,
+      kind: "action",
+      text: `${src.label} use ${label} to ${dst.label}`,
+    });
   });
 
   // Chat and dice

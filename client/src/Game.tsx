@@ -20,7 +20,7 @@ type TokenPatch = {
 type View = { x: number; y: number; z: number }; // pan in screen px, zoom factor
 type Pt = { x: number; y: number };
 type Dims = { w: number; h: number };
-type Tab = "token" | "chat" | "dice" | "tokens" | "map" | "invite";
+type Tab = "token" | "chat" | "dice" | "tokens" | "map" | "invite" | "settings";
 type Gesture =
   | { kind: "pan"; sx: number; sy: number; vx: number; vy: number; moved: boolean; tap?: string }
   | { kind: "token"; id: string; dx: number; dy: number; sx: number; sy: number; moved: boolean }
@@ -41,6 +41,7 @@ const NAMES_KEY = "vtt:names";
 const SIZES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 const D3_SIDES = [4, 6, 8, 10, 12, 20];
 const MAX_3D_DICE = 8;
+const PANEL_W = 460; // width of the side panel on laptop screens
 
 const floating: CSSProperties = {
   background: "#fff", border: "1px solid #bbb", borderRadius: 10, boxShadow: "0 6px 24px #0005",
@@ -52,13 +53,24 @@ const TAB_ICONS: Record<Tab, { src: string; label: string }> = {
   tokens: { src: "/assets/user.webp", label: "Tokens" },
   map: { src: "/assets/map.webp", label: "Map" },
   invite: { src: "/assets/invitelink.webp", label: "Invite players" },
+  settings: { src: "/assets/gearsettings.webp", label: "Settings" },
 };
+
+// The action buttons shown for a selected token. What each one does comes later.
+const TOKEN_ACTIONS = [
+  { id: "sword", label: "Melee Attack", src: "/assets/sword.webp" },
+  { id: "bow", label: "Bow", src: "/assets/bowarrow.webp" },
+  { id: "spell", label: "Spellbook", src: "/assets/spellbook.webp" },
+  { id: "potion", label: "Potion", src: "/assets/potionbottle.webp" },
+] as const;
+type ActionId = (typeof TOKEN_ACTIONS)[number]["id"];
 
 // A tab shown as an icon only. The name appears as a tooltip.
 function IconTab({
-  id, variant, size, active, badge, onClick,
+  id, variant, size, active, badge, stretch, onClick,
 }: {
-  id: Tab; variant: "tab" | "dock"; size: number; active?: boolean; badge?: number; onClick: () => void;
+  id: Tab; variant: "tab" | "dock"; size: number; active?: boolean; badge?: number; stretch?: boolean;
+  onClick: () => void;
 }) {
   const t = TAB_ICONS[id];
   const base: CSSProperties = {
@@ -69,7 +81,8 @@ function IconTab({
     variant === "dock"
       ? { ...base, ...floating, width: size + 20, height: size + 20, borderRadius: "50%" }
       : {
-          ...base, width: size + 22, height: size + 16, border: "none",
+          ...base, height: size + 16, border: "none",
+          ...(stretch ? { flex: 1, minWidth: 0 } : { width: size + 22 }),
           borderBottom: `3px solid ${active ? "#222" : "transparent"}`,
           borderRadius: "6px 6px 0 0", background: active ? "#ececec" : "transparent",
         };
@@ -90,6 +103,26 @@ function IconTab({
           {badge}
         </span>
       ) : null}
+    </button>
+  );
+}
+
+// Find: centers the map on a token. Shown as an icon to save space.
+function FindButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      title="Find token"
+      aria-label="Find token"
+      style={{
+        padding: 3, width: 30, height: 28, cursor: "pointer",
+        display: "inline-flex", alignItems: "center", justifyContent: "center",
+      }}
+    >
+      <img
+        src="/assets/findtoken.webp" alt="" width={20} height={20} draggable={false}
+        style={{ mixBlendMode: "multiply", pointerEvents: "none" }}
+      />
     </button>
   );
 }
@@ -152,9 +185,11 @@ function useNarrow() {
 }
 
 const toastText = (m: Msg) =>
-  m.kind === "roll" && m.roll
-    ? `${m.fromName} rolled ${m.roll.formula} = ${m.roll.total}`
-    : `${m.fromName}${m.to ? " (whisper)" : ""}: ${m.text ?? ""}`;
+  m.kind === "action"
+    ? m.text ?? ""
+    : m.kind === "roll" && m.roll
+      ? `${m.fromName} rolled ${m.roll.formula} = ${m.roll.total}`
+      : `${m.fromName}${m.to ? " (whisper)" : ""}: ${m.text ?? ""}`;
 
 export default function Game({ init }: { init: Init }) {
   const { me } = init;
@@ -189,6 +224,9 @@ export default function Game({ init }: { init: Init }) {
   const [menuOpen, setMenuOpen] = useState(false);
     const [pwOpen, setPwOpen] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+    const [action, setAction] = useState<{ tokenId: string; id: ActionId } | null>(null);
+      const [picker, setPicker] = useState<{ sourceId: string; actionId: ActionId } | null>(null);
+  const [tweens, setTweens] = useState<Record<string, number>>({}); // token id -> glide time in ms
   const [hoverId, setHoverId] = useState<string | null>(null);
   const [unread, setUnread] = useState(0);
   const [toast, setToast] = useState<Msg | null>(null);
@@ -241,7 +279,9 @@ export default function Game({ init }: { init: Init }) {
     }
   };
 
-    const tabs: Tab[] = isGm ? ["chat", "dice", "tokens", "map", "invite"] : ["token", "chat", "dice"];
+    const tabs: Tab[] = isGm
+    ? ["chat", "dice", "tokens", "map", "invite", "settings"]
+    : ["token", "chat", "dice", "settings"];
 
   useEffect(() => {
     chatVisible.current = open && tab === "chat";
@@ -410,6 +450,20 @@ export default function Game({ init }: { init: Init }) {
     socket.on("moved", ({ id, x, y }: { id: string; x: number; y: number }) =>
       setTokens((all) => (all[id] ? { ...all, [id]: { ...all[id], x, y } } : all))
     );
+        // A token glides to a new spot (for example a melee attack): the same straight-line move on every screen
+    socket.on("tween", ({ id, x, y, ms }: { id: string; x: number; y: number; ms: number }) => {
+      setTweens((all) => ({ ...all, [id]: ms }));
+      setTokens((all) => (all[id] ? { ...all, [id]: { ...all[id], x, y } } : all));
+      window.setTimeout(
+        () =>
+          setTweens((all) => {
+            const next = { ...all };
+            delete next[id];
+            return next;
+          }),
+        ms + 60
+      );
+    });
     socket.on("chat", (m: Msg) => {
       // Messages are handled one at a time so dice animations do not overlap
       queue.current = queue.current.then(async () => {
@@ -444,6 +498,7 @@ export default function Game({ init }: { init: Init }) {
       socket.off("tokenUpdated");
       socket.off("tokenRemoved");
       socket.off("moved");
+            socket.off("tween");
       socket.off("chat");
     };
   }, [applyView, fitMap, me.id]);
@@ -583,6 +638,7 @@ export default function Game({ init }: { init: Init }) {
         setSelectedId(g.tap); // tap on a token you cannot move: show its name
       } else {
         setSelectedId(null); // tap on empty map
+        setAction(null);
         if (!isGm) setOpen(false); // players: also closes the panel
       }
     }
@@ -616,7 +672,7 @@ export default function Game({ init }: { init: Init }) {
     let sy = h / 2;
     if (open) {
       if (narrow) sy = (h * 0.42) / 2;
-      else sx = Math.max(100, (w - 392) / 2);
+            else sx = Math.max(100, (w - (PANEL_W + 12)) / 2);
     }
     const v = view.current;
     const cx = (sx - v.x) / v.z;
@@ -735,7 +791,63 @@ export default function Game({ init }: { init: Init }) {
 
   const panelPos: CSSProperties = narrow
     ? { left: 0, right: 0, bottom: 0, height: "58%", borderRadius: "12px 12px 0 0" }
-    : { top: 12, right: 12, width: 380, height: "min(620px, calc(100% - 24px))" };
+    : { top: 12, right: 12, width: PANEL_W, height: "calc(100% - 24px)" };
+
+  // Action buttons: the GM can use them on any token, a player only on their own
+  const selectedToken = selectedId ? tokens[selectedId] : undefined;
+  const actionToken = selectedToken && canMove(selectedToken) ? selectedToken : undefined;
+
+    // Smooth glide while a token is being moved by an action
+  const tweenCss = (id: string) =>
+    tweens[id] ? `left ${tweens[id]}ms ease-in-out, top ${tweens[id]}ms ease-in-out` : undefined;
+
+  const closePicker = () => {
+    setPicker(null);
+    setAction(null); // cancels the whole process
+  };
+
+  const onTokenAction = (id: ActionId) => {
+    if (!actionToken) return;
+    if (id === "sword") {
+      setAction({ tokenId: actionToken.id, id });
+      setPicker({ sourceId: actionToken.id, actionId: id });
+      return;
+    }
+    setAction((cur) =>
+      cur && cur.tokenId === actionToken.id && cur.id === id ? null : { tokenId: actionToken.id, id }
+    );
+  };
+
+  // A target was chosen: send it, then clear the screen so the movement can be seen
+  const chooseTarget = (target: Token) => {
+    if (!picker) return;
+    socket.emit("tokenAction", { from: picker.sourceId, to: target.id, action: picker.actionId });
+    setPicker(null);
+    setAction(null);
+    setSelectedId(null); // hides the action buttons
+    setMenuOpen(false);
+    setOpen(false); // minimizes the panel
+  };
+
+  const pickerSource = picker ? tokens[picker.sourceId] : undefined;
+  const targets = picker
+    ? Object.values(tokens)
+        .filter((t) => t.id !== picker.sourceId)
+        .sort((a, b) => a.label.localeCompare(b.label))
+    : [];
+
+  // Esc closes the target popup
+  useEffect(() => {
+    if (!picker) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setPicker(null);
+        setAction(null);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [picker]);
 
   return (
     <div style={{ position: "fixed", inset: 0, overflow: "hidden", fontFamily: "sans-serif", background: "#222" }}>
@@ -778,6 +890,7 @@ export default function Game({ init }: { init: Init }) {
               style={{
                 position: "absolute", left: t.x, top: t.y, width: t.size * CELL, height: t.size * CELL,
                 zIndex: t.z ?? 0, opacity: t.hidden ? 0.45 : 1, cursor: canMove(t) ? "pointer" : "default",
+                transition: tweenCss(t.id),
               }}
             >
               <div
@@ -805,7 +918,7 @@ export default function Game({ init }: { init: Init }) {
               style={{
                 position: "absolute", left: t.x + (t.size * CELL) / 2, top: t.y + t.size * CELL + 2,
                 transform: "translateX(-50%)", zIndex: 100000, pointerEvents: "none",
-                display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
+                display: "flex", flexDirection: "column", alignItems: "center", gap: 2, transition: tweenCss(t.id),
               }}
             >
               <span
@@ -904,6 +1017,90 @@ export default function Game({ init }: { init: Init }) {
         </div>
       )}
 
+            {/* ---------- Melee Attack: choose a target ---------- */}
+      {picker && pickerSource && (
+        <div
+          onClick={closePicker}
+          style={{
+            position: "absolute", inset: 0, zIndex: 150, background: "#0004",
+            display: "flex", alignItems: "center", justifyContent: "center", padding: 16,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{ ...floating, width: 320, maxWidth: "100%", maxHeight: "70%", display: "flex", flexDirection: "column" }}
+          >
+            <div style={{ ...row, padding: "10px 12px", borderBottom: "1px solid #ddd" }}>
+              <img src="/assets/sword.webp" alt="" width={22} height={22} style={{ mixBlendMode: "multiply" }} />
+              <b style={{ flex: 1 }}>Melee Attack</b>
+              <button onClick={closePicker} aria-label="Close">✕</button>
+            </div>
+            <div style={{ padding: "8px 12px 0", fontSize: 12, color: "#777" }}>
+              {pickerSource.label}: choose a target
+            </div>
+            <div style={{ overflowY: "auto", padding: 8 }}>
+              {targets.length === 0 && <div style={{ color: "#777", padding: 8 }}>There are no other tokens.</div>}
+              {targets.map((t) => (
+                <button
+                  key={t.id}
+                  onClick={() => chooseTarget(t)}
+                  style={{
+                    display: "flex", width: "100%", alignItems: "center", gap: 8, textAlign: "left",
+                    padding: "8px 10px", marginBottom: 4, cursor: "pointer",
+                    border: "1px solid #ddd", borderRadius: 8, background: "#fff",
+                  }}
+                >
+                  <span
+                    style={{
+                      width: 16, height: 16, borderRadius: "50%", flex: "none",
+                      background: t.image ? `url(${t.image}) center / cover` : t.color,
+                    }}
+                  />
+                  <span style={{ flex: 1 }}>
+                    {t.label}
+                    {t.hidden ? " (hidden)" : ""}
+                  </span>
+                  <span style={{ fontSize: 11, color: "#777" }}>{ownerName(t.ownerId)}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+      {/* ---------- token action buttons: shown while one of your tokens is selected ---------- */}
+      {actionToken && (
+        <div
+          style={{
+            position: "absolute", left: 0, right: open && !narrow ? PANEL_W + 12 : 0,
+            bottom: narrow && open ? "calc(58% + 12px)" : 16, zIndex: 80,
+            display: "flex", justifyContent: "center", gap: narrow ? 8 : 10, pointerEvents: "none",
+          }}
+        >
+          {TOKEN_ACTIONS.map((a) => {
+            const on = action !== null && action.tokenId === actionToken.id && action.id === a.id;
+            const d = narrow ? 56 : 72;
+            return (
+              <button
+                key={a.id}
+                title={`${a.label} (${actionToken.label})`}
+                aria-label={a.label}
+                onClick={() => onTokenAction(a.id)}
+                style={{
+                  ...floating, pointerEvents: "auto", width: d, height: d, borderRadius: "50%", padding: 0,
+                  cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
+                  border: on ? "3px solid #f1c40f" : "1px solid #bbb", background: on ? "#fff6cc" : "#fff",
+                }}
+              >
+                <img
+                  src={a.src} alt="" width={d * 0.6} height={d * 0.6} draggable={false}
+                  style={{ mixBlendMode: "multiply", pointerEvents: "none" }}
+                />
+              </button>
+            );
+          })}
+        </div>
+      )}
+
       {/* ---------- GM dock (panel minimized) ---------- */}
       {!open && isGm && (
         <div
@@ -922,7 +1119,7 @@ export default function Game({ init }: { init: Init }) {
       )}
 
       {/* ---------- first-time hint for players ---------- */}
-      {hint && !open && (
+      {hint && !open && !actionToken && (
         <div
           style={{
             position: "absolute", left: "50%", bottom: 16, transform: "translateX(-50%)", zIndex: 90,
@@ -957,23 +1154,17 @@ export default function Game({ init }: { init: Init }) {
             borderRadius: 10, ...panelPos,
           }}
         >
-          <div
-            style={{
-              display: "flex", alignItems: "center", gap: 4, padding: "8px 8px 0",
-              borderBottom: "1px solid #ddd", flexWrap: "wrap",
-            }}
-          >
-                        {tabs.map((t) => (
+                    <div style={{ display: "flex", alignItems: "stretch", gap: 2, padding: "8px 8px 0", borderBottom: "1px solid #ddd" }}>
+            {tabs.map((t) => (
               <IconTab
-                key={t} id={t} variant="tab" size={22} active={tab === t}
+                key={t} id={t} variant="tab" size={22} stretch active={tab === t}
                 badge={t === "chat" ? unread : 0} onClick={() => openTab(t)}
               />
             ))}
-            <span style={{ flex: 1 }} />
             <button
               onClick={() => setOpen(false)}
               title={isGm ? "Minimize" : "Close"}
-              style={{ border: "none", background: "transparent", cursor: "pointer", fontSize: 16 }}
+              style={{ flex: "none", width: 36, border: "none", background: "transparent", cursor: "pointer", fontSize: 16 }}
             >
               {isGm ? "–" : "✕"}
             </button>
@@ -981,10 +1172,15 @@ export default function Game({ init }: { init: Init }) {
 
           <div style={{ flex: 1, overflowY: "auto", padding: 12 }}>
             <div style={show("chat")}>
-              <ChatPanel mode="chat" me={me} members={members} messages={messages} dice3d={dice3d} onDice3d={setDice3d} />
+                <ChatPanel mode="chat" large={!narrow} me={me} members={members} messages={messages} dice3d={dice3d} onDice3d={setDice3d} />
             </div>
             <div style={show("dice")}>
-              <ChatPanel mode="dice" me={me} members={members} messages={messages} dice3d={dice3d} onDice3d={setDice3d} />
+                <ChatPanel mode="dice" large={!narrow} me={me} members={members} messages={messages} dice3d={dice3d} onDice3d={setDice3d} />  
+            </div>
+
+            {/* Settings: empty for now, for both GM and players */}
+            <div style={show("settings")}>
+              <div style={{ color: "#777", fontSize: 13 }}>Nothing here yet.</div>
             </div>
 
             {/* Player: own token(s) */}
@@ -1005,7 +1201,7 @@ export default function Game({ init }: { init: Init }) {
                         <b>{t.label}</b>
                         <div style={{ fontSize: 12, color: "#777" }}>Size {t.size}x{t.size}</div>
                       </div>
-                      <button onClick={() => centerOn(t)}>Find</button>
+                      <FindButton onClick={() => centerOn(t)} />
                     </div>
                     <div style={{ ...row, marginTop: 8 }}>
                       HP
@@ -1075,85 +1271,153 @@ export default function Game({ init }: { init: Init }) {
 
                 {status}
                 {Object.values(tokens).length === 0 && <div style={{ color: "#777" }}>No tokens yet.</div>}
-                {Object.values(tokens).map((t) => (
-                  <div key={t.id} id={`tok-${t.id}`} style={cardStyle(t.id)}>
-                    <div style={row}>
-                      <input type="color" value={t.color} onChange={(e) => update(t.id, { color: e.target.value })} />
-                      <input
-                        key={t.id + t.label}
-                        defaultValue={t.label}
-                        maxLength={20}
-                        style={{ flex: 1, minWidth: 80 }}
-                        onBlur={(e) => {
-                          const v = e.target.value.trim();
-                          if (v && v !== t.label) update(t.id, { label: v });
-                        }}
-                      />
-                      <button onClick={() => centerOn(t)}>Find</button>
-                      <button onClick={() => socket.emit("removeToken", t.id)}>Delete</button>
-                    </div>
-                    <div style={{ ...row, marginTop: 6 }}>
-                      <select value={t.size} onChange={(e) => update(t.id, { size: Number(e.target.value) })}>
-                        {SIZES.map((s) => (
-                          <option key={s} value={s}>{s}x{s}</option>
-                        ))}
-                      </select>
-                      <select value={t.ownerId ?? ""} onChange={(e) => update(t.id, { ownerId: e.target.value || null })}>
-                        <option value="">GM (NPC / monster)</option>
-                        {players.map((p) => (
-                          <option key={p.id} value={p.id}>{p.name}</option>
-                        ))}
-                      </select>
-                    </div>
-                    <div style={{ ...row, marginTop: 6 }}>
-                      HP
-                      <input
-                        key={`${t.id}hp${t.hp}`} type="number" defaultValue={t.hp} style={{ width: 55 }}
-                        onBlur={(e) => {
-                          const v = Number(e.target.value);
-                          if (!Number.isNaN(v) && v !== t.hp) update(t.id, { hp: v });
-                        }}
-                      />
-                      /
-                      <input
-                        key={`${t.id}max${t.maxHp}`} type="number" defaultValue={t.maxHp} style={{ width: 55 }}
-                        onBlur={(e) => {
-                          const v = Number(e.target.value);
-                          if (!Number.isNaN(v) && v !== t.maxHp) update(t.id, { maxHp: v });
-                        }}
-                      />
-                    </div>
-                    <div style={{ ...row, marginTop: 6 }}>
-                      <label style={{ fontSize: 13 }}>
-                        <input
-                          type="checkbox" checked={!!t.hidden}
-                          onChange={(e) => update(t.id, { hidden: e.target.checked })}
-                        />{" "}
-                        Hidden from players
-                      </label>
-                    </div>
-                    <div style={{ ...row, marginTop: 6 }}>
-                      <span style={{ fontSize: 13 }}>Layer</span>
-                      <button onClick={() => socket.emit("reorder", { id: t.id, op: "back" })}>Back</button>
-                      <button onClick={() => socket.emit("reorder", { id: t.id, op: "down" })} title="One step down">▼</button>
-                      <button onClick={() => socket.emit("reorder", { id: t.id, op: "up" })} title="One step up">▲</button>
-                      <button onClick={() => socket.emit("reorder", { id: t.id, op: "front" })}>Front</button>
-                    </div>
-                    <div style={{ ...row, marginTop: 6 }}>
-                      <button
-                        disabled={!!busy}
-                        onClick={() => {
-                          tokenUploadId.current = t.id;
-                          tokenFileRef.current?.click();
-                        }}
+                                {Object.values(tokens).map((t) => {
+                  const sel = t.id === selectedId;
+
+                  // Compact row: only HP and Find
+                  if (!sel) {
+                    return (
+                      <div
+                        key={t.id}
+                        id={`tok-${t.id}`}
+                        onClick={() => setSelectedId(t.id)}
+                        title="Click to edit this token"
+                        style={{ ...cardStyle(t.id), padding: 8, cursor: "pointer", opacity: t.hidden ? 0.7 : 1 }}
                       >
-                        {t.image ? "Change image" : "Add image"}
-                      </button>
-                      {t.image && <button onClick={() => socket.emit("clearTokenImage", t.id)}>Remove image</button>}
+                        <div style={row}>
+                          <span
+                            style={{
+                              width: 22, height: 22, borderRadius: "50%", flex: "none", border: "1px solid #bbb",
+                              background: t.image ? `url(${t.image}) center / cover no-repeat` : t.color,
+                            }}
+                          />
+                          <b
+                            style={{
+                              flex: 1, minWidth: 60, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                            }}
+                          >
+                            {t.label}
+                            {t.hidden ? " (hidden)" : ""}
+                          </b>
+                          <span style={{ ...row, flexWrap: "nowrap" }} onClick={(e) => e.stopPropagation()}>
+                            HP
+                            <input
+                              key={`${t.id}hp${t.hp}`} type="number" defaultValue={t.hp} style={{ width: 45 }}
+                              onBlur={(e) => {
+                                const v = Number(e.target.value);
+                                if (!Number.isNaN(v) && v !== t.hp) update(t.id, { hp: v });
+                              }}
+                            />
+                            /
+                            <input
+                              key={`${t.id}max${t.maxHp}`} type="number" defaultValue={t.maxHp} style={{ width: 45 }}
+                              onBlur={(e) => {
+                                const v = Number(e.target.value);
+                                if (!Number.isNaN(v) && v !== t.maxHp) update(t.id, { maxHp: v });
+                              }}
+                            />
+                            <FindButton onClick={() => centerOn(t)} />
+                          </span>
+                        </div>
+                        {hpBar(t)}
+                      </div>
+                    );
+                  }
+
+                  // Selected token: the full editor
+                  return (
+                    <div key={t.id} id={`tok-${t.id}`} style={cardStyle(t.id)}>
+                      <div style={row}>
+                        <input type="color" value={t.color} onChange={(e) => update(t.id, { color: e.target.value })} />
+                        <input
+                          key={t.id + t.label}
+                          defaultValue={t.label}
+                          maxLength={20}
+                          style={{ flex: 1, minWidth: 80 }}
+                          onBlur={(e) => {
+                            const v = e.target.value.trim();
+                            if (v && v !== t.label) update(t.id, { label: v });
+                          }}
+                        />
+                        <FindButton onClick={() => centerOn(t)} />
+                        <button
+                          onClick={() => {
+                            setSelectedId(null);
+                            setAction(null);
+                          }}
+                          title="Close the editor"
+                        >
+                          Done
+                        </button>
+                      </div>
+                      <div style={{ ...row, marginTop: 6 }}>
+                        <select value={t.size} onChange={(e) => update(t.id, { size: Number(e.target.value) })}>
+                          {SIZES.map((s) => (
+                            <option key={s} value={s}>{s}x{s}</option>
+                          ))}
+                        </select>
+                        <select value={t.ownerId ?? ""} onChange={(e) => update(t.id, { ownerId: e.target.value || null })}>
+                          <option value="">GM (NPC / monster)</option>
+                          {players.map((p) => (
+                            <option key={p.id} value={p.id}>{p.name}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div style={{ ...row, marginTop: 6 }}>
+                        HP
+                        <input
+                          key={`${t.id}hp${t.hp}`} type="number" defaultValue={t.hp} style={{ width: 55 }}
+                          onBlur={(e) => {
+                            const v = Number(e.target.value);
+                            if (!Number.isNaN(v) && v !== t.hp) update(t.id, { hp: v });
+                          }}
+                        />
+                        /
+                        <input
+                          key={`${t.id}max${t.maxHp}`} type="number" defaultValue={t.maxHp} style={{ width: 55 }}
+                          onBlur={(e) => {
+                            const v = Number(e.target.value);
+                            if (!Number.isNaN(v) && v !== t.maxHp) update(t.id, { maxHp: v });
+                          }}
+                        />
+                      </div>
+                      <div style={{ ...row, marginTop: 6 }}>
+                        <label style={{ fontSize: 13 }}>
+                          <input
+                            type="checkbox" checked={!!t.hidden}
+                            onChange={(e) => update(t.id, { hidden: e.target.checked })}
+                          />{" "}
+                          Hidden from players
+                        </label>
+                      </div>
+                      <div style={{ ...row, marginTop: 6 }}>
+                        <span style={{ fontSize: 13 }}>Layer</span>
+                        <button onClick={() => socket.emit("reorder", { id: t.id, op: "back" })}>Back</button>
+                        <button onClick={() => socket.emit("reorder", { id: t.id, op: "down" })} title="One step down">▼</button>
+                        <button onClick={() => socket.emit("reorder", { id: t.id, op: "up" })} title="One step up">▲</button>
+                        <button onClick={() => socket.emit("reorder", { id: t.id, op: "front" })}>Front</button>
+                      </div>
+                      <div style={{ ...row, marginTop: 6 }}>
+                        <button
+                          disabled={!!busy}
+                          onClick={() => {
+                            tokenUploadId.current = t.id;
+                            tokenFileRef.current?.click();
+                          }}
+                        >
+                          {t.image ? "Change image" : "Add image"}
+                        </button>
+                        {t.image && <button onClick={() => socket.emit("clearTokenImage", t.id)}>Remove image</button>}
+                      </div>
+                      {lookControls(t)}
+                      <div style={{ ...row, marginTop: 10 }}>
+                        <button onClick={() => socket.emit("removeToken", t.id)} style={{ color: "#c0392b" }}>
+                          Delete token
+                        </button>
+                      </div>
                     </div>
-                    {lookControls(t)}
-                  </div>
-                ))}
+                  );
+                })} 
               </div>
             )}
 

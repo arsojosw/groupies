@@ -10,7 +10,7 @@ export type MapInfo = { image?: string; w: number; h: number };
 export type Roll = { formula: string; rolls: number[]; sides: number; total: number; keep?: boolean[] };
 export type Msg = {
   id: string; ts: number; fromId: string; fromName: string;
-  to: string[] | null; kind: "text" | "roll"; text?: string; roll?: Roll;
+    to: string[] | null; kind: "text" | "roll" | "action"; text?: string; roll?: Roll;
 };
 export type Invite = {
   code: string; expiresAt: number; uses: number; maxUses: number;

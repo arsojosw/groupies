@@ -1,4 +1,5 @@
 import { useState } from "react";
+import type { CSSProperties } from "react";
 import { socket } from "./socket";
 import { row } from "./styles";
 import type { Me, Member, Msg, Roll } from "./types";
@@ -7,6 +8,7 @@ type Props = {
   me: Me; members: Member[]; messages: Msg[];
   mode: "chat" | "dice";
   dice3d: boolean; onDice3d: (v: boolean) => void;
+  large?: boolean; // laptop screens: taller log and bigger fields
 };
 
 // Dropped dice (keep highest / keep lowest) are shown crossed out
@@ -24,7 +26,7 @@ function RollText({ r }: { r: Roll }) {
   );
 }
 
-export default function ChatPanel({ me, members, messages, mode, dice3d, onDice3d }: Props) {
+export default function ChatPanel({ me, members, messages, mode, dice3d, onDice3d, large }: Props) {
   const [target, setTarget] = useState("all");
   const [text, setText] = useState("");
   const [formula, setFormula] = useState("1d20+3");
@@ -51,6 +53,13 @@ export default function ChatPanel({ me, members, messages, mode, dice3d, onDice3
   // Newest first. The dice tab shows rolls only.
   const shown = [...(mode === "dice" ? messages.filter((m) => m.kind === "roll") : messages)].reverse();
 
+  // Bigger fields and a taller log on laptop screens
+  const field: CSSProperties = large ? { fontSize: 16, padding: "10px 12px" } : {};
+  const button: CSSProperties = large ? { fontSize: 15, padding: "10px 18px" } : {};
+  const logHeight = large
+    ? mode === "chat" ? "calc(100vh - 205px)" : "calc(100vh - 275px)"
+    : "min(45vh, 320px)";
+
   return (
     <div>
       <div style={row}>
@@ -70,23 +79,23 @@ export default function ChatPanel({ me, members, messages, mode, dice3d, onDice3
       </div>
 
       {mode === "chat" ? (
-        <div style={{ ...row, marginTop: 6 }}>
+        <div style={{ ...row, marginTop: 6, flexWrap: "nowrap" }}>
           <input
-            value={text} placeholder="Message" maxLength={500} style={{ flex: 1, minWidth: 0 }}
+            value={text} placeholder="Message" maxLength={500} style={{ flex: 1, minWidth: 0, ...field }}
             onChange={(e) => setText(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && send()}
           />
-          <button onClick={send}>Send</button>
+          <button style={button} onClick={send}>Send</button>
         </div>
       ) : (
         <>
-          <div style={{ ...row, marginTop: 6 }}>
+          <div style={{ ...row, marginTop: 6, flexWrap: "nowrap" }}>
             <input
-              value={formula} style={{ flex: 1, minWidth: 0 }}
+              value={formula} style={{ flex: 1, minWidth: 0, ...field }}
               onChange={(e) => setFormula(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && roll()}
             />
-            <button onClick={roll}>Roll</button>
+            <button style={button} onClick={roll}>Roll</button>
           </div>
           <div style={{ ...row, marginTop: 6 }}>
             <button onClick={() => setFormula("2d20kh1")}>Adv</button>
@@ -103,8 +112,8 @@ export default function ChatPanel({ me, members, messages, mode, dice3d, onDice3
 
       <div
         style={{
-          height: "min(45vh, 320px)", overflowY: "auto", border: "1px solid #eee",
-          borderRadius: 6, padding: 6, marginTop: 8, fontSize: 14,
+          height: logHeight, minHeight: large ? 200 : undefined, overflowY: "auto",
+          border: "1px solid #eee", borderRadius: 6, padding: 6, marginTop: 8, fontSize: large ? 15 : 14,
         }}
       >
         {shown.length === 0 && (
@@ -118,10 +127,19 @@ export default function ChatPanel({ me, members, messages, mode, dice3d, onDice3
             <span style={{ fontSize: 11, color: "#777" }}>
               {new Date(m.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}{" "}
             </span>
-            <b>{m.fromName}</b>
-            {tag(m) && <span style={{ fontSize: 11, color: "#7b3fb5" }}> ({tag(m)})</span>}
-            {": "}
-            {m.kind === "roll" && m.roll ? <RollText r={m.roll} /> : m.text}
+            {m.kind === "action" ? (
+              <>
+                <i>{m.text}</i>
+                {tag(m) && <span style={{ fontSize: 11, color: "#7b3fb5" }}> ({tag(m)})</span>}
+              </>
+            ) : (
+              <>
+                <b>{m.fromName}</b>
+                {tag(m) && <span style={{ fontSize: 11, color: "#7b3fb5" }}> ({tag(m)})</span>}
+                {": "}
+                {m.kind === "roll" && m.roll ? <RollText r={m.roll} /> : m.text}
+              </>
+            )}
           </div>
         ))}
       </div>
