@@ -3,10 +3,13 @@ import type { ChangeEvent, CSSProperties, PointerEvent } from "react";
 import DiceBox from "@3d-dice/dice-box-threejs";
 import ChatPanel from "./ChatPanel";
 import ChangePassword from "./ChangePassword";
-import { prepareMap, prepareToken, upload } from "./imageUtils";
+import { prepareMap, prepareThumb, prepareToken, upload } from "./imageUtils";
 import { signOut, socket } from "./socket";
 import { row } from "./styles";
-import type { Init, Invite, MapInfo, Member, Msg, Token } from "./types";
+import type {
+  Init, Invite, MapInfo, MapSummary, MapsPayload, Member, Msg, Roll, SavedToken, Tier, TierInfo, Token,
+} from "./types";
+
 
 type DiceBoxLike = {
   roll: (notation: string) => Promise<unknown>;
@@ -20,7 +23,7 @@ type TokenPatch = {
 type View = { x: number; y: number; z: number }; // pan in screen px, zoom factor
 type Pt = { x: number; y: number };
 type Dims = { w: number; h: number };
-type Tab = "token" | "chat" | "dice" | "tokens" | "map" | "invite" | "settings";
+type Tab = "token" | "chat" | "dice" | "tokens" | "library" | "invite" | "settings";
 type Gesture =
   | { kind: "pan"; sx: number; sy: number; vx: number; vy: number; moved: boolean; tap?: string }
   | { kind: "token"; id: string; dx: number; dy: number; sx: number; sy: number; moved: boolean }
@@ -40,7 +43,9 @@ const HINT_KEY = "vtt:hint";
 const NAMES_KEY = "vtt:names";
 const SIZES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 const D3_SIDES = [4, 6, 8, 10, 12, 20];
-const MAX_3D_DICE = 8;
+const MAX_3D_DICE = 10;
+const TIER_NAMES: Record<Tier, string> = { free: "Free", basic: "Basic", pro: "Pro", master: "Master" };
+const fmtMb = (bytes: number) => (bytes / 1024 / 1024).toFixed(1);
 const PANEL_W = 460; // width of the side panel on laptop screens
 
 const floating: CSSProperties = {
@@ -51,19 +56,31 @@ const TAB_ICONS: Record<Tab, { src: string; label: string }> = {
   chat: { src: "/assets/chat.webp", label: "Chat" },
   dice: { src: "/assets/dice.webp", label: "Dice" },
   tokens: { src: "/assets/user.webp", label: "Tokens" },
-  map: { src: "/assets/map.webp", label: "Map" },
   invite: { src: "/assets/invitelink.webp", label: "Invite players" },
   settings: { src: "/assets/gearsettings.webp", label: "Settings" },
+    library: { src: "/assets/library.svg", label: "Library" },
 };
 
 // The action buttons shown for a selected token. What each one does comes later.
 const TOKEN_ACTIONS = [
   { id: "sword", label: "Melee Attack", src: "/assets/sword.webp" },
-  { id: "bow", label: "Bow", src: "/assets/bowarrow.webp" },
+  { id: "bow", label: "Ranged Attack", src: "/assets/bowarrow.webp" },
   { id: "spell", label: "Spellbook", src: "/assets/spellbook.webp" },
   { id: "potion", label: "Potion", src: "/assets/potionbottle.webp" },
 ] as const;
 type ActionId = (typeof TOKEN_ACTIONS)[number]["id"];
+// Ammo for the Ranged Attack. The pictures point up; size is in map pixels.
+const AMMO_TYPES = [
+  { id: "arrow", label: "Arrow / Bolts", src: "/assets/arrowbolt.webp", size: 56 },
+  { id: "gun", label: "Gun Ammo", src: "/assets/gunammo.webp", size: 22 },
+] as const;
+type AmmoId = (typeof AMMO_TYPES)[number]["id"];
+
+// A temporary ammo token in flight (never saved; it only exists on screen)
+type Shot = {
+  id: string; ammo: AmmoId; sx: number; sy: number; ex: number; ey: number;
+  angle: number; ms: number; go: boolean;
+};
 
 // A tab shown as an icon only. The name appears as a tooltip.
 function IconTab({
@@ -210,7 +227,7 @@ export default function Game({ init }: { init: Init }) {
   const [inviteHours, setInviteHours] = useState(24);
   const [inviteUses, setInviteUses] = useState(6);
   const [inviteError, setInviteError] = useState("");
-  const [squaresDraft, setSquaresDraft] = useState<string | null>(null);
+  const [squaresDraft, setSquaresDraft] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState("");
   const [uploadError, setUploadError] = useState("");
   const [dice3d, setDice3d] = useState(() => loadFlag(DICE_KEY, true));
@@ -222,10 +239,27 @@ export default function Game({ init }: { init: Init }) {
   const [open, setOpen] = useState(isGm); // GM starts with the panel open, players with it closed
   const [tab, setTab] = useState<Tab>(isGm ? "tokens" : "token");
   const [menuOpen, setMenuOpen] = useState(false);
-    const [pwOpen, setPwOpen] = useState(false);
+  const [pwOpen, setPwOpen] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-    const [action, setAction] = useState<{ tokenId: string; id: ActionId } | null>(null);
-      const [picker, setPicker] = useState<{ sourceId: string; actionId: ActionId } | null>(null);
+  const [action, setAction] = useState<{ tokenId: string; id: ActionId } | null>(null);
+  const [picker, setPicker] = useState<{ sourceId: string; actionId: ActionId; ammo?: AmmoId } | null>(null);
+  const [shots, setShots] = useState<Shot[]>([]);
+  const [shaking, setShaking] = useState<Record<string, boolean>>({}); // tokens that are shaking from a hit
+  const [rollPopup, setRollPopup] = useState<{ id: string; who: string; roll: Roll; note: string } | null>(null);
+  const popupTimer = useRef<number | undefined>(undefined);
+  const [lastOwn, setLastOwn] = useState(-1); // which of my tokens "My token" went to last
+    // GM library: maps and saved tokens
+  const [maps, setMaps] = useState<MapSummary[]>(init.maps ?? []);
+  const [activeMapId, setActiveMapId] = useState(init.activeMapId ?? "");
+  const [tier, setTier] = useState<TierInfo | null>(init.tier ?? null);
+  const [library, setLibrary] = useState<SavedToken[]>(init.library ?? []);
+  const [newMapName, setNewMapName] = useState("");
+  const [libNote, setLibNote] = useState("");
+  const libTimer = useRef<number | undefined>(undefined);
+    const [newSave, setNewSave] = useState(true); // also save new tokens to the library
+  const [thumbTick, setThumbTick] = useState(0);
+  const thumbsTried = useRef(new Set<string>());
+  const thumbBusy = useRef(false);
   const [tweens, setTweens] = useState<Record<string, number>>({}); // token id -> glide time in ms
   const [hoverId, setHoverId] = useState<string | null>(null);
   const [unread, setUnread] = useState(0);
@@ -238,6 +272,7 @@ export default function Game({ init }: { init: Init }) {
   const mapFileRef = useRef<HTMLInputElement>(null);
   const tokenFileRef = useRef<HTMLInputElement>(null);
   const tokenUploadId = useRef<string | null>(null);
+  const mapUploadId = useRef<string | null>(null); // which map the picture file picker is for
   const view = useRef<View>({ x: 20, y: 20, z: 1 });
   const dims = useRef<Dims>({ w: init.map.w, h: init.map.h });
   const lastImage = useRef(init.map.image);
@@ -280,7 +315,7 @@ export default function Game({ init }: { init: Init }) {
   };
 
     const tabs: Tab[] = isGm
-    ? ["chat", "dice", "tokens", "map", "invite", "settings"]
+    ? ["chat", "dice", "tokens", "library", "invite", "settings"]
     : ["token", "chat", "dice", "settings"];
 
   useEffect(() => {
@@ -409,7 +444,11 @@ export default function Game({ init }: { init: Init }) {
     const layer = document.getElementById("dice-layer");
     (async () => {
       try {
-        const box: DiceBoxLike = new DiceBox("#dice-layer", { sounds: false, theme_colorset: "white" });
+                // Smaller dice on phones (baseScale is the dice size, 100 = normal)
+        const small = window.matchMedia("(max-width: 700px)").matches;
+        const box: DiceBoxLike = new DiceBox("#dice-layer", {
+          sounds: false, theme_colorset: "white", baseScale: small ? 50 : 100,
+        });
         if (typeof box.initialize === "function") await box.initialize();
         if (!cancelled) diceRef.current = box;
       } catch (err) {
@@ -422,6 +461,26 @@ export default function Game({ init }: { init: Init }) {
       layer?.replaceChildren();
     };
   }, []);
+
+  // GM: make small previews for maps that have a picture but no preview yet (also for older maps)
+  useEffect(() => {
+    if (!isGm || thumbBusy.current) return;
+    const m = maps.find((x) => x.image && !x.thumb && !thumbsTried.current.has(`${x.id}|${x.image}`));
+    if (!m || !m.image) return;
+    const url = m.image;
+    thumbsTried.current.add(`${m.id}|${url}`);
+    thumbBusy.current = true;
+    (async () => {
+      try {
+        const blob = await prepareThumb(url);
+        await upload("thumb", blob, { mapId: m.id });
+      } catch {
+        /* the preview just stays empty */
+      }
+      thumbBusy.current = false;
+      setThumbTick((n) => n + 1); // look for the next map without a preview
+    })();
+  }, [maps, isGm, thumbTick]);
 
   // ---------- live events ----------
   useEffect(() => {
@@ -464,6 +523,61 @@ export default function Game({ init }: { init: Init }) {
         ms + 60
       );
     });
+        // A shot flies from one token to another and disappears on impact
+    socket.on("projectile", (p: Omit<Shot, "go">) => {
+      setShots((all) => [...all, { ...p, go: false }]);
+      // Start the flight two frames later so the browser animates it
+      window.requestAnimationFrame(() =>
+        window.requestAnimationFrame(() =>
+          setShots((all) => all.map((s) => (s.id === p.id ? { ...s, go: true } : s)))
+        )
+      );
+      window.setTimeout(() => setShots((all) => all.filter((s) => s.id !== p.id)), p.ms + 100);
+    });
+        // The target of an attack shakes a little when the hit lands (its real position does not change)
+    socket.on("hit", ({ id, delay }: { id: string; delay: number }) => {
+      window.setTimeout(() => {
+        setShaking((all) => ({ ...all, [id]: true }));
+        window.setTimeout(
+          () =>
+            setShaking((all) => {
+              const next = { ...all };
+              delete next[id];
+              return next;
+            }),
+          450
+        );
+      }, delay + 30);
+    });
+
+        // GM library
+    socket.on("maps", (d: MapsPayload) => {
+      setMaps(d.maps);
+      setActiveMapId(d.activeMapId);
+      setTier(d.tier);
+    });
+    socket.on("library", setLibrary);
+    socket.on("chatCleared", () => {
+      setMessages([]);
+      setUnread(0);
+      setToast(null);
+      setRollPopup(null);
+    });
+    // The GM opened another map: everyone gets its picture and tokens
+    socket.on("scene", ({ map: m, tokens: t }: { map: MapInfo; tokens: Record<string, Token> }) => {
+      dims.current = { w: m.w, h: m.h };
+      lastImage.current = m.image;
+      setMap(m);
+      setTokens(t);
+      setSelectedId(null);
+      setAction(null);
+      setPicker(null);
+      setShots([]);
+      setShaking({});
+      setTweens({});
+      fitMap();
+    });
+    
     socket.on("chat", (m: Msg) => {
       // Messages are handled one at a time so dice animations do not overlap
       queue.current = queue.current.then(async () => {
@@ -481,12 +595,23 @@ export default function Game({ init }: { init: Init }) {
           }
         }
         setMessages((all) => (all.some((x) => x.id === m.id) ? all : [...all, m].slice(-200)));
+                // A roll: show the total in a popup once the dice have settled
+        if (m.kind === "roll" && m.roll) {
+          const note =
+            m.to === null ? "" : m.fromId === me.id && m.to.length === 1 && m.to[0] === me.id ? "secret roll" : "whisper";
+          setRollPopup({ id: m.id, who: m.fromName, roll: m.roll, note });
+          window.clearTimeout(popupTimer.current);
+          popupTimer.current = window.setTimeout(() => setRollPopup(null), 4000);
+        }
         // Someone else's message while the chat is not on screen: unread count and a short pop-up
+        // (rolls already have their own popup)
         if (m.fromId !== me.id && !chatVisible.current) {
           setUnread((u) => u + 1);
-          setToast(m);
-          window.clearTimeout(toastTimer.current);
-          toastTimer.current = window.setTimeout(() => setToast(null), 6000);
+          if (m.kind !== "roll") {
+            setToast(m);
+            window.clearTimeout(toastTimer.current);
+            toastTimer.current = window.setTimeout(() => setToast(null), 6000);
+          }
         }
       });
     });
@@ -498,7 +623,13 @@ export default function Game({ init }: { init: Init }) {
       socket.off("tokenUpdated");
       socket.off("tokenRemoved");
       socket.off("moved");
-            socket.off("tween");
+      socket.off("tween");
+      socket.off("projectile");
+      socket.off("hit");
+            socket.off("maps");
+      socket.off("library");
+      socket.off("chatCleared");
+      socket.off("scene");
       socket.off("chat");
     };
   }, [applyView, fitMap, me.id]);
@@ -666,44 +797,62 @@ export default function Game({ init }: { init: Init }) {
   };
 
   // New tokens appear in the middle of the part of the map the GM can see
+    // Middle of the part of the map the GM can see, for a token of this size
+    const spawnPoint = (size: number): Pt => {
+      const { w, h } = vpSize();
+      let sx = w / 2;
+      let sy = h / 2;
+      if (open) {
+        if (narrow) sy = (h * 0.42) / 2;
+        else sx = Math.max(100, (w - (PANEL_W + 12)) / 2);
+      }
+      const v = view.current;
+      const cx = (sx - v.x) / v.z;
+      const cy = (sy - v.y) / v.z;
+      return snapPos(dims.current, size, cx - (size * CELL) / 2, cy - (size * CELL) / 2);
+    };
+
   const addToken = () => {
-    const { w, h } = vpSize();
-    let sx = w / 2;
-    let sy = h / 2;
-    if (open) {
-      if (narrow) sy = (h * 0.42) / 2;
-            else sx = Math.max(100, (w - (PANEL_W + 12)) / 2);
-    }
-    const v = view.current;
-    const cx = (sx - v.x) / v.z;
-    const cy = (sy - v.y) / v.z;
-    const s = snapPos(dims.current, newSize, cx - (newSize * CELL) / 2, cy - (newSize * CELL) / 2);
+    const s = spawnPoint(newSize);
     socket.emit("addToken", {
       label: newLabel, color: newColor, size: newSize, ownerId: newOwner || null,
-      hp: newHp, maxHp: newHp, x: s.x, y: s.y, hidden: newHidden,
+      hp: newHp, maxHp: newHp, x: s.x, y: s.y, hidden: newHidden, save: newSave,
     });
     setNewLabel("");
   };
 
-  const applySquares = () => {
-    const n = Number(squaresDraft ?? Math.round(map.w / CELL));
-    socket.emit("setMap", sizeFor(n, map.h / map.w));
-    setSquaresDraft(null);
+    // Apply the "squares across" number of one map (the picture keeps its shape)
+  const applySquares = (m: MapSummary) => {
+    const n = Number(squaresDraft[m.id] ?? Math.round(m.w / CELL));
+    socket.emit("setMap", { id: m.id, ...sizeFor(n, m.h / m.w) });
+    setSquaresDraft((d) => {
+      const next = { ...d };
+      delete next[m.id];
+      return next;
+    });
   };
 
   const onMapFile = async (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = "";
-    if (!file) return;
-    setBusy("Uploading map...");
+    const mapId = mapUploadId.current;
+    if (!file || !mapId) return;
+    setBusy("Uploading map picture...");
     setUploadError("");
     try {
       const p = await prepareMap(file);
       // Guess the grid: most battle maps use about 70 px per square
       const size = sizeFor(Math.round(p.width / 70), p.height / p.width);
-      const err = await upload("map", p.blob, size);
-      if (err) setUploadError(err);
-      else setSquaresDraft(null);
+      const err = await upload("map", p.blob, { ...size, mapId });
+      if (err) {
+        setUploadError(err);
+      } else {
+        setSquaresDraft((d) => {
+          const next = { ...d };
+          delete next[mapId];
+          return next;
+        });
+      }
     } catch (err) {
       setUploadError(err instanceof Error ? err.message : "Upload failed");
     }
@@ -744,9 +893,61 @@ export default function Game({ init }: { init: Init }) {
     socket.emit("removePlayer", { id });
   };
 
+    // ---------- library: maps and saved tokens ----------
+  const flash = (text: string) => {
+    setLibNote(text);
+    window.clearTimeout(libTimer.current);
+    libTimer.current = window.setTimeout(() => setLibNote(""), 3500);
+  };
+
+  const mapsFull = !!tier && tier.mapCount >= tier.maxMaps;
+
+  const createMap = () => {
+    socket.emit("createMap", { name: newMapName }, (r: { ok?: boolean; error?: string }) => {
+      if (r?.ok) setNewMapName("");
+      else flash(r?.error ?? "Could not add the map");
+    });
+  };
+
+  const openMap = (m: MapSummary) => {
+    if (m.id === activeMapId) return;
+    if (!window.confirm(`Switch everyone to "${m.name}" now? Players will see this map right away.`)) return;
+    socket.emit("activateMap", m.id);
+  };
+
+  const deleteMap = (m: MapSummary) => {
+    if (!window.confirm(`Delete the map "${m.name}" with all its tokens and its picture? This cannot be undone.`)) return;
+    socket.emit("deleteMap", m.id, (r: { ok?: boolean; error?: string }) => {
+      if (!r?.ok) flash(r?.error ?? "Could not delete the map");
+    });
+  };
+
+  const saveToLibrary = (t: Token) =>
+    socket.emit("saveToken", { id: t.id }, (r: { ok?: boolean; error?: string }) =>
+      flash(r?.ok ? `"${t.label}" saved to the library` : r?.error ?? "Could not save the token")
+    );
+
+  const addFromLibrary = (s: SavedToken) => {
+    const p = spawnPoint(s.size);
+    socket.emit("libraryAdd", { id: s.id, x: p.x, y: p.y });
+    flash(`"${s.label}" added to the map`);
+  };
+
+    // GM: delete all chat messages for everyone
+  const clearChat = () => {
+    if (!window.confirm("Clear the whole chat for everyone? This cannot be undone.")) return;
+    socket.emit("clearChat");
+  };
   const hpColor = (t: Token) => {
     const pct = (t.hp ?? 0) / (t.maxHp || 1);
     return pct > 0.5 ? "#2ecc71" : pct > 0.25 ? "#f1c40f" : "#e74c3c";
+  };
+    // "My token" in the menu: go to my first token, press again for the next one, then back to the first
+  const cycleOwnToken = () => {
+    if (ownTokens.length === 0) return;
+    const next = (lastOwn + 1) % ownTokens.length;
+    setLastOwn(next);
+    centerOn(ownTokens[next]);
   };
 
   const inviteLink = (code: string) => `${window.location.origin}/?join=${code}`;
@@ -808,9 +1009,9 @@ export default function Game({ init }: { init: Init }) {
 
   const onTokenAction = (id: ActionId) => {
     if (!actionToken) return;
-    if (id === "sword") {
+    if (id === "sword" || id === "bow") {
       setAction({ tokenId: actionToken.id, id });
-      setPicker({ sourceId: actionToken.id, actionId: id });
+      setPicker({ sourceId: actionToken.id, actionId: id }); // Ranged Attack asks for the ammo first
       return;
     }
     setAction((cur) =>
@@ -818,10 +1019,15 @@ export default function Game({ init }: { init: Init }) {
     );
   };
 
-  // A target was chosen: send it, then clear the screen so the movement can be seen
+  // Ranged Attack, step 1: the ammo is chosen, then the target list opens
+  const chooseAmmo = (ammo: AmmoId) => setPicker((cur) => (cur ? { ...cur, ammo } : cur));
+
+  // A target was chosen: send it, then clear the screen so the movement or shot can be seen
   const chooseTarget = (target: Token) => {
     if (!picker) return;
-    socket.emit("tokenAction", { from: picker.sourceId, to: target.id, action: picker.actionId });
+    socket.emit("tokenAction", {
+      from: picker.sourceId, to: target.id, action: picker.actionId, ammo: picker.ammo,
+    });
     setPicker(null);
     setAction(null);
     setSelectedId(null); // hides the action buttons
@@ -830,13 +1036,17 @@ export default function Game({ init }: { init: Init }) {
   };
 
   const pickerSource = picker ? tokens[picker.sourceId] : undefined;
-  const targets = picker
-    ? Object.values(tokens)
-        .filter((t) => t.id !== picker.sourceId)
-        .sort((a, b) => a.label.localeCompare(b.label))
-    : [];
+  const pickerAction = picker ? TOKEN_ACTIONS.find((a) => a.id === picker.actionId) : undefined;
+  const pickerAmmo = picker && picker.ammo ? AMMO_TYPES.find((a) => a.id === picker.ammo) : undefined;
+  const needAmmo = !!picker && picker.actionId === "bow" && !picker.ammo;
+  const targets =
+    picker && !needAmmo
+      ? Object.values(tokens)
+          .filter((t) => t.id !== picker.sourceId)
+          .sort((a, b) => a.label.localeCompare(b.label))
+      : [];
 
-  // Esc closes the target popup
+  // Esc closes the popup
   useEffect(() => {
     if (!picker) return;
     const onKey = (e: KeyboardEvent) => {
@@ -851,6 +1061,20 @@ export default function Game({ init }: { init: Init }) {
 
   return (
     <div style={{ position: "fixed", inset: 0, overflow: "hidden", fontFamily: "sans-serif", background: "#222" }}>
+            <style>{`
+        @keyframes vttShake {
+          0%, 100% { transform: translate(0, 0); }
+          15% { transform: translate(-8%, 3%); }
+          30% { transform: translate(8%, -3%); }
+          45% { transform: translate(-6%, -2%); }
+          60% { transform: translate(6%, 2%); }
+          75% { transform: translate(-3%, 0); }
+          90% { transform: translate(3%, 0); }
+        }
+        @media (prefers-reduced-motion: reduce) {
+          [data-token-id] { animation: none !important; }
+        }
+      `}</style>
       {/* ---------- full screen map ---------- */}
       <div
         ref={viewportRef}
@@ -891,12 +1115,13 @@ export default function Game({ init }: { init: Init }) {
                 position: "absolute", left: t.x, top: t.y, width: t.size * CELL, height: t.size * CELL,
                 zIndex: t.z ?? 0, opacity: t.hidden ? 0.45 : 1, cursor: canMove(t) ? "pointer" : "default",
                 transition: tweenCss(t.id),
+                animation: shaking[t.id] ? "vttShake 0.4s ease-in-out" : undefined,
               }}
             >
               <div
                 style={{
-                  width: "100%", height: "100%", borderRadius: "50%", boxSizing: "border-box",
-                  background: t.image ? `url(${t.image}) center / cover no-repeat` : t.color,
+                  width: "100%", height: "100%", borderRadius: t.image ? 0 : "50%", boxSizing: "border-box",
+                  background: t.image ? `url(${t.image}) center / contain no-repeat` : t.color,
                   border: t.image
                     ? "none"
                     : `3px ${t.hidden ? "dashed" : "solid"} ${
@@ -948,6 +1173,29 @@ export default function Game({ init }: { init: Init }) {
               )}
             </div>
           ))}
+          {/* temporary ammo tokens in flight */}
+          {shots.map((s) => {
+            const a = AMMO_TYPES.find((x) => x.id === s.ammo);
+            if (!a) return null;
+            return (
+              <img
+                key={s.id}
+                src={a.src}
+                alt=""
+                width={a.size}
+                height={a.size}
+                draggable={false}
+                style={{
+                  position: "absolute", zIndex: 99999, pointerEvents: "none", mixBlendMode: "multiply",
+                  left: (s.go ? s.ex : s.sx) - a.size / 2,
+                  top: (s.go ? s.ey : s.sy) - a.size / 2,
+                  // The pictures point up, so +90 turns "up" toward the direction of flight
+                  transform: `rotate(${s.angle + 90}deg)`,
+                  transition: s.go ? `left ${s.ms}ms ease-in, top ${s.ms}ms ease-in` : "none",
+                }}
+              />
+            );
+          })}
         </div>
         {/* 3D dice are drawn over the visible area, not the whole map; clicks pass through */}
         <div id="dice-layer" style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 50 }} />
@@ -998,7 +1246,16 @@ export default function Game({ init }: { init: Init }) {
           </div>
           <div style={{ ...row, marginTop: 6 }}>
             <button onClick={fitMap}>Fit map</button>
-            {mine && <button onClick={() => centerOn(mine)}>My token</button>}
+            {ownTokens.length > 0 && (
+              <button onClick={cycleOwnToken} title="Go to my token (press again for the next one)">
+                My token
+                {ownTokens.length > 1
+                  ? lastOwn >= 0
+                    ? ` ${Math.min(lastOwn, ownTokens.length - 1) + 1}/${ownTokens.length}`
+                    : ` (${ownTokens.length})`
+                  : ""}
+              </button>
+            )}
           </div>
           <label style={{ display: "block", fontSize: 13, marginTop: 8 }}>
             <input type="checkbox" checked={snap} onChange={(e) => setSnap(e.target.checked)} /> Snap to grid
@@ -1016,9 +1273,42 @@ export default function Game({ init }: { init: Init }) {
           )}
         </div>
       )}
-
-            {/* ---------- Melee Attack: choose a target ---------- */}
-      {picker && pickerSource && (
+            {/* ---------- dice result popup ---------- */}
+      {rollPopup && (
+        <div
+          onClick={() => setRollPopup(null)}
+          style={{
+            ...floating, position: "absolute", left: "50%", top: narrow ? "14%" : "18%",
+            transform: "translateX(-50%)", zIndex: 130, padding: "12px 24px", textAlign: "center",
+            cursor: "pointer", minWidth: 150, maxWidth: "calc(100% - 32px)",
+          }}
+        >
+          <div style={{ fontSize: 12, color: "#555" }}>
+            {rollPopup.who} rolled {rollPopup.roll.formula}
+            {rollPopup.note ? ` (${rollPopup.note})` : ""}
+          </div>
+          <div style={{ fontSize: 48, fontWeight: 700, lineHeight: 1.1 }}>{rollPopup.roll.total}</div>
+          <div style={{ fontSize: 12, color: "#777" }}>
+            [
+            {rollPopup.roll.rolls.map((v, i) => (
+              <span
+                key={i}
+                style={
+                  rollPopup.roll.keep && !rollPopup.roll.keep[i]
+                    ? { textDecoration: "line-through", color: "#aaa" }
+                    : undefined
+                }
+              >
+                {v}
+                {i < rollPopup.roll.rolls.length - 1 ? ", " : ""}
+              </span>
+            ))}
+            ]
+          </div>
+        </div>
+      )}
+            {/* ---------- action popups: ammo (Ranged Attack only), then target ---------- */}
+      {picker && pickerSource && pickerAction && (
         <div
           onClick={closePicker}
           style={{
@@ -1031,39 +1321,66 @@ export default function Game({ init }: { init: Init }) {
             style={{ ...floating, width: 320, maxWidth: "100%", maxHeight: "70%", display: "flex", flexDirection: "column" }}
           >
             <div style={{ ...row, padding: "10px 12px", borderBottom: "1px solid #ddd" }}>
-              <img src="/assets/sword.webp" alt="" width={22} height={22} style={{ mixBlendMode: "multiply" }} />
-              <b style={{ flex: 1 }}>Melee Attack</b>
+              <img src={pickerAction.src} alt="" width={22} height={22} style={{ mixBlendMode: "multiply" }} />
+              <b style={{ flex: 1 }}>{pickerAction.label}</b>
               <button onClick={closePicker} aria-label="Close">✕</button>
             </div>
-            <div style={{ padding: "8px 12px 0", fontSize: 12, color: "#777" }}>
-              {pickerSource.label}: choose a target
-            </div>
-            <div style={{ overflowY: "auto", padding: 8 }}>
-              {targets.length === 0 && <div style={{ color: "#777", padding: 8 }}>There are no other tokens.</div>}
-              {targets.map((t) => (
-                <button
-                  key={t.id}
-                  onClick={() => chooseTarget(t)}
-                  style={{
-                    display: "flex", width: "100%", alignItems: "center", gap: 8, textAlign: "left",
-                    padding: "8px 10px", marginBottom: 4, cursor: "pointer",
-                    border: "1px solid #ddd", borderRadius: 8, background: "#fff",
-                  }}
-                >
-                  <span
-                    style={{
-                      width: 16, height: 16, borderRadius: "50%", flex: "none",
-                      background: t.image ? `url(${t.image}) center / cover` : t.color,
-                    }}
-                  />
-                  <span style={{ flex: 1 }}>
-                    {t.label}
-                    {t.hidden ? " (hidden)" : ""}
-                  </span>
-                  <span style={{ fontSize: 11, color: "#777" }}>{ownerName(t.ownerId)}</span>
-                </button>
-              ))}
-            </div>
+
+            {needAmmo ? (
+              <>
+                <div style={{ padding: "8px 12px 0", fontSize: 12, color: "#777" }}>
+                  {pickerSource.label}: choose the ammo
+                </div>
+                <div style={{ padding: 8 }}>
+                  {AMMO_TYPES.map((a) => (
+                    <button
+                      key={a.id}
+                      onClick={() => chooseAmmo(a.id)}
+                      style={{
+                        display: "flex", width: "100%", alignItems: "center", gap: 10, textAlign: "left",
+                        padding: "8px 10px", marginBottom: 4, cursor: "pointer",
+                        border: "1px solid #ddd", borderRadius: 8, background: "#fff",
+                      }}
+                    >
+                      <img src={a.src} alt="" width={28} height={28} style={{ mixBlendMode: "multiply" }} />
+                      <span style={{ flex: 1 }}>{a.label}</span>
+                    </button>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <>
+                <div style={{ padding: "8px 12px 0", fontSize: 12, color: "#777" }}>
+                  {pickerSource.label}: choose a target{pickerAmmo ? ` (${pickerAmmo.label})` : ""}
+                </div>
+                <div style={{ overflowY: "auto", padding: 8 }}>
+                  {targets.length === 0 && <div style={{ color: "#777", padding: 8 }}>There are no other tokens.</div>}
+                  {targets.map((t) => (
+                    <button
+                      key={t.id}
+                      onClick={() => chooseTarget(t)}
+                      style={{
+                        display: "flex", width: "100%", alignItems: "center", gap: 8, textAlign: "left",
+                        padding: "8px 10px", marginBottom: 4, cursor: "pointer",
+                        border: "1px solid #ddd", borderRadius: 8, background: "#fff",
+                      }}
+                    >
+                      <span
+                        style={{
+                          width: 16, height: 16, borderRadius: "50%", flex: "none",
+                          background: t.image ? `url(${t.image}) center / contain` : t.color,
+                        }}
+                      />
+                      <span style={{ flex: 1 }}>
+                        {t.label}
+                        {t.hidden ? " (hidden)" : ""}
+                      </span>
+                      <span style={{ fontSize: 11, color: "#777" }}>{ownerName(t.ownerId)}</span>
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}
@@ -1172,10 +1489,22 @@ export default function Game({ init }: { init: Init }) {
 
           <div style={{ flex: 1, overflowY: "auto", padding: 12 }}>
             <div style={show("chat")}>
-                <ChatPanel mode="chat" large={!narrow} me={me} members={members} messages={messages} dice3d={dice3d} onDice3d={setDice3d} />
+                          <ChatPanel
+                mode="chat" large={!narrow} me={me} members={members} messages={messages}
+                dice3d={dice3d} onDice3d={setDice3d} onClear={isGm ? clearChat : undefined}
+              />    
             </div>
             <div style={show("dice")}>
-                <ChatPanel mode="dice" large={!narrow} me={me} members={members} messages={messages} dice3d={dice3d} onDice3d={setDice3d} />  
+                <ChatPanel
+                mode="dice" large={!narrow} me={me} members={members} messages={messages} dice3d={dice3d} onDice3d={setDice3d}
+                onRoll={() => {
+                  // On phones, clear the screen so the dice can be seen
+                  if (narrow) {
+                    setOpen(false);
+                    setMenuOpen(false);
+                  }
+                }}
+              />
             </div>
 
             {/* Settings: empty for now, for both GM and players */}
@@ -1193,7 +1522,7 @@ export default function Game({ init }: { init: Init }) {
                       <span
                         style={{
                           width: 44, height: 44, borderRadius: "50%", flex: "none", border: "2px solid #ddd",
-                          background: t.image ? `url(${t.image}) center / cover no-repeat` : t.color,
+                          background: t.image ? `url(${t.image}) center / contain no-repeat` : t.color,
                           transform: t.image ? `rotate(${t.rot ?? 0}deg) scaleX(${t.flip ? -1 : 1})` : undefined,
                         }}
                       />
@@ -1262,6 +1591,10 @@ export default function Game({ init }: { init: Init }) {
                       <input type="checkbox" checked={newHidden} onChange={(e) => setNewHidden(e.target.checked)} />{" "}
                       Hidden from players
                     </label>
+                    <label style={{ fontSize: 13 }}>
+                      <input type="checkbox" checked={newSave} onChange={(e) => setNewSave(e.target.checked)} />{" "}
+                      Save to library
+                    </label>
                     <button onClick={addToken}>Add</button>
                   </div>
                   <div style={{ fontSize: 12, color: "#777", marginTop: 6 }}>
@@ -1288,7 +1621,7 @@ export default function Game({ init }: { init: Init }) {
                           <span
                             style={{
                               width: 22, height: 22, borderRadius: "50%", flex: "none", border: "1px solid #bbb",
-                              background: t.image ? `url(${t.image}) center / cover no-repeat` : t.color,
+                              background: t.image ? `url(${t.image}) center / contain no-repeat` : t.color,
                             }}
                           />
                           <b
@@ -1410,43 +1743,173 @@ export default function Game({ init }: { init: Init }) {
                         {t.image && <button onClick={() => socket.emit("clearTokenImage", t.id)}>Remove image</button>}
                       </div>
                       {lookControls(t)}
-                      <div style={{ ...row, marginTop: 10 }}>
+                                            <div style={{ ...row, marginTop: 10 }}>
+                        {library.some((s) => s.fromTokenId === t.id) ? (
+                          <span style={{ fontSize: 12, color: "#1a7f37" }} title="Name, picture, size and max HP stay in step">
+                            ✓ In the library
+                          </span>
+                        ) : (
+                          <button onClick={() => saveToLibrary(t)} title="Keep a copy to reuse on any map">
+                            Save to library
+                          </button>
+                        )}
                         <button onClick={() => socket.emit("removeToken", t.id)} style={{ color: "#c0392b" }}>
                           Delete token
                         </button>
                       </div>
+                      {libNote && <div style={{ fontSize: 12, color: "#1a5fb4", marginTop: 4 }}>{libNote}</div>}
                     </div>
                   );
                 })} 
               </div>
             )}
 
-            {/* GM: map settings */}
+            {/* GM: library of maps and saved tokens */}
             {isGm && (
-              <div style={show("map")}>
-                <div style={row}>
-                  <button disabled={!!busy} onClick={() => mapFileRef.current?.click()}>
-                    {map.image ? "Replace map image" : "Upload map image"}
-                  </button>
-                  {map.image && <button onClick={() => socket.emit("clearMap")}>Remove image</button>}
-                </div>
-                <div style={{ ...row, marginTop: 8 }}>
-                  <label style={{ fontSize: 13 }}>
-                    Squares across{" "}
-                    <input
-                      type="number" min={10} max={100} style={{ width: 60 }}
-                      value={squaresDraft ?? String(Math.round(map.w / CELL))}
-                      onChange={(e) => setSquaresDraft(e.target.value)}
-                    />
-                  </label>
-                  <button onClick={applySquares}>Apply</button>
-                  <span style={{ fontSize: 12, color: "#777" }}>{map.w} × {map.h} px</span>
-                </div>
-                <div style={{ fontSize: 12, color: "#777", marginTop: 8 }}>
-                  If the picture's own grid does not line up with the game grid, change "Squares across" and press
-                  Apply. PNG, JPG or WebP. Large images are resized for you.
-                </div>
+              <div style={show("library")}>
+                <div style={{ fontWeight: 600 }}>Maps {tier ? `${tier.mapCount} / ${tier.maxMaps}` : ""}</div>
+                {tier && (
+                  <div style={{ fontSize: 12, color: "#777" }}>
+                    {TIER_NAMES[tier.tier]} tier · pictures use {fmtMb(tier.usedBytes)} of {tier.storageMb} MB
+                  </div>
+                )}
+                {libNote && <div style={{ fontSize: 13, color: "#1a5fb4", marginTop: 4 }}>{libNote}</div>}
                 {status}
+                <div style={{ ...row, marginTop: 8, flexWrap: "nowrap" }}>
+                  <input
+                    placeholder="New map name" value={newMapName} maxLength={40} style={{ flex: 1, minWidth: 0 }}
+                    onChange={(e) => setNewMapName(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && !mapsFull && createMap()}
+                  />
+                  <button onClick={createMap} disabled={mapsFull}>Add map</button>
+                </div>
+                {tier && mapsFull && (
+                  <div style={{ fontSize: 12, color: "#c0392b", marginTop: 4 }}>
+                    Map limit reached for the {TIER_NAMES[tier.tier]} tier. Delete a map or ask for a higher tier.
+                  </div>
+                )}
+
+                {maps.map((m) => {
+                  const active = m.id === activeMapId;
+                  const pic = m.thumb ?? m.image;
+                  return (
+                    <div
+                      key={m.id}
+                      style={{
+                        display: "flex", gap: 8, border: active ? "2px solid #f1c40f" : "1px solid #ddd",
+                        borderRadius: 8, padding: 8, marginTop: 8,
+                      }}
+                    >
+                      <div
+                        onClick={() => openMap(m)}
+                        title={active ? "This map is in play" : "Click to open this map"}
+                        style={{
+                          width: 96, height: 72, flex: "none", borderRadius: 6, overflow: "hidden",
+                          background: "#e8e0cc", border: "1px solid #ccc", cursor: active ? "default" : "pointer",
+                          display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, color: "#777",
+                        }}
+                      >
+                        {pic ? (
+                          <img
+                            src={pic} alt="" loading="lazy" draggable={false}
+                            style={{ width: "100%", height: "100%", objectFit: "contain" }}
+                          />
+                        ) : (
+                          "No picture"
+                        )}
+                      </div>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <input
+                          key={m.id + m.name}
+                          defaultValue={m.name}
+                          maxLength={40}
+                          style={{ width: "100%", boxSizing: "border-box" }}
+                          onBlur={(e) => {
+                            const v = e.target.value.trim();
+                            if (v && v !== m.name) socket.emit("renameMap", { id: m.id, name: v });
+                          }}
+                        />
+                        <div style={{ ...row, marginTop: 4 }}>
+                          {active ? (
+                            <b style={{ fontSize: 12, color: "#8a6d00" }}>In play</b>
+                          ) : (
+                            <button onClick={() => openMap(m)}>Open</button>
+                          )}
+                          <button
+                            disabled={active}
+                            onClick={() => deleteMap(m)}
+                            title={active ? "Open another map first" : "Delete this map"}
+                            style={{ color: active ? undefined : "#c0392b" }}
+                          >
+                            Delete
+                          </button>
+                        </div>
+                        <div style={{ fontSize: 11, color: "#777", marginTop: 2 }}>
+                          {Math.round(m.w / CELL)} × {Math.round(m.h / CELL)} squares
+                        </div>
+                                                <details style={{ marginTop: 6 }}>
+                          <summary style={{ cursor: "pointer", fontSize: 13 }}>Settings</summary>
+                          <div style={{ ...row, marginTop: 6 }}>
+                            <button
+                              disabled={!!busy}
+                              onClick={() => {
+                                mapUploadId.current = m.id;
+                                mapFileRef.current?.click();
+                              }}
+                            >
+                              {m.image ? "Replace picture" : "Upload picture"}
+                            </button>
+                            {m.image && <button onClick={() => socket.emit("clearMap", m.id)}>Remove picture</button>}
+                          </div>
+                          <div style={{ ...row, marginTop: 6 }}>
+                            <label style={{ fontSize: 13 }}>
+                              Squares across{" "}
+                              <input
+                                type="number" min={10} max={100} style={{ width: 60 }}
+                                value={squaresDraft[m.id] ?? String(Math.round(m.w / CELL))}
+                                onChange={(e) => setSquaresDraft((d) => ({ ...d, [m.id]: e.target.value }))}
+                              />
+                            </label>
+                            <button onClick={() => applySquares(m)}>Apply</button>
+                            <span style={{ fontSize: 12, color: "#777" }}>{m.w} × {m.h} px</span>
+                          </div>
+                          <div style={{ fontSize: 11, color: "#777", marginTop: 6 }}>
+                            If the picture's own grid does not line up with the game grid, change "Squares across"
+                            and press Apply. PNG, JPG or WebP. Large images are resized for you.
+                          </div>
+                        </details>
+                      </div>
+                    </div>
+                  );
+                })}
+
+                <div style={{ marginTop: 18, fontWeight: 600 }}>Saved tokens ({library.length})</div>
+                <div style={{ fontSize: 12, color: "#777", marginBottom: 4 }}>
+                  Select a token in the Tokens tab and press "Save to library". Saved tokens stay here even after you
+                  delete them from a map. "Add to map" puts a fresh copy in the middle of your view.
+                </div>
+                {library.length === 0 && <div style={{ color: "#777", fontSize: 13 }}>No saved tokens yet.</div>}
+                {library.map((s) => (
+                  <div
+                    key={s.id}
+                    style={{ ...row, flexWrap: "nowrap", borderTop: "1px solid #eee", marginTop: 6, paddingTop: 6 }}
+                  >
+                    <span
+                      style={{
+                        width: 26, height: 26, borderRadius: "50%", flex: "none", border: "1px solid #bbb",
+                        background: s.image ? `url(${s.image}) center / contain no-repeat` : s.color,
+                      }}
+                    />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.label}</div>
+                      <div style={{ fontSize: 11, color: "#777" }}>{s.size}x{s.size} · HP {s.maxHp}</div>
+                    </div>
+                    <button onClick={() => addFromLibrary(s)}>Add to map</button>
+                    <button onClick={() => socket.emit("libraryDelete", s.id)} style={{ color: "#c0392b" }}>
+                      Delete
+                    </button>
+                  </div>
+                ))}
               </div>
             )}
 

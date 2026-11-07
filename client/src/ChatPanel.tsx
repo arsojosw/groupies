@@ -9,7 +9,11 @@ type Props = {
   mode: "chat" | "dice";
   dice3d: boolean; onDice3d: (v: boolean) => void;
   large?: boolean; // laptop screens: taller log and bigger fields
+  onRoll?: () => void; // called after a roll is sent (phones use it to clear the screen)
+    onClear?: () => void; // GM only: shows a "Clear chat" button
 };
+
+const DICE = [2, 4, 6, 8, 10, 12, 20, 100];
 
 // Dropped dice (keep highest / keep lowest) are shown crossed out
 function RollText({ r }: { r: Roll }) {
@@ -26,7 +30,7 @@ function RollText({ r }: { r: Roll }) {
   );
 }
 
-export default function ChatPanel({ me, members, messages, mode, dice3d, onDice3d, large }: Props) {
+export default function ChatPanel({ me, members, messages, mode, dice3d, onDice3d, large, onRoll, onClear }: Props) {
   const [target, setTarget] = useState("all");
   const [text, setText] = useState("");
   const [formula, setFormula] = useState("1d20+3");
@@ -40,7 +44,18 @@ export default function ChatPanel({ me, members, messages, mode, dice3d, onDice3
     socket.emit("chat", { text: t, to: toList() });
     setText("");
   };
-  const roll = () => socket.emit("roll", { formula, to: toList() });
+
+  const roll = () => {
+    socket.emit("roll", { formula, to: toList() });
+    onRoll?.();
+  };
+
+  // Dice button: the same dice again adds one more die (1d4, 2d4, 3d4...); a different dice starts over
+  const addDie = (sides: number) => {
+    const m = formula.trim().match(/^(\d+)d(\d+)$/i);
+    const count = m && Number(m[2]) === sides ? Math.min(Number(m[1]) + 1, 100) : 1;
+    setFormula(`${count}d${sides}`);
+  };
 
   const tag = (m: Msg) => {
     if (m.to === null) return "";
@@ -56,8 +71,11 @@ export default function ChatPanel({ me, members, messages, mode, dice3d, onDice3
   // Bigger fields and a taller log on laptop screens
   const field: CSSProperties = large ? { fontSize: 16, padding: "10px 12px" } : {};
   const button: CSSProperties = large ? { fontSize: 15, padding: "10px 18px" } : {};
+  const dieButton: CSSProperties = large
+    ? { fontSize: 14, padding: "8px 10px", minWidth: 50 }
+    : { padding: "6px 8px", minWidth: 40 };
   const logHeight = large
-    ? mode === "chat" ? "calc(100vh - 205px)" : "calc(100vh - 275px)"
+    ? mode === "chat" ? "calc(100vh - 205px)" : "calc(100vh - 315px)"
     : "min(45vh, 320px)";
 
   return (
@@ -76,6 +94,11 @@ export default function ChatPanel({ me, members, messages, mode, dice3d, onDice3
         <span style={{ fontSize: 12, color: "#777" }}>
           applies to {mode === "chat" ? "messages" : "rolls"}
         </span>
+        {mode === "chat" && onClear && (
+          <button onClick={onClear} style={{ marginLeft: "auto" }} title="Delete all messages for everyone">
+            Clear chat
+          </button>
+        )}
       </div>
 
       {mode === "chat" ? (
@@ -96,6 +119,13 @@ export default function ChatPanel({ me, members, messages, mode, dice3d, onDice3
               onKeyDown={(e) => e.key === "Enter" && roll()}
             />
             <button style={button} onClick={roll}>Roll</button>
+          </div>
+          <div style={{ ...row, marginTop: 6, gap: 4 }}>
+            {DICE.map((s) => (
+              <button key={s} style={dieButton} onClick={() => addDie(s)} title={`Add a d${s}`}>
+                D{s}
+              </button>
+            ))}
           </div>
           <div style={{ ...row, marginTop: 6 }}>
             <button onClick={() => setFormula("2d20kh1")}>Adv</button>

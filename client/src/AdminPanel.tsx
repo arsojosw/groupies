@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type { CSSProperties } from "react";
 import { signOut, socket } from "./socket";
-import type { AdminInit, GmRow, LogEntry } from "./types";
+import type { AdminInit, GmRow, LogEntry, Tier, TierSetting } from "./types";
 
 const th: CSSProperties = { textAlign: "left", padding: "8px 10px", borderBottom: "2px solid #ddd", whiteSpace: "nowrap" };
 const td: CSSProperties = { padding: "8px 10px", borderBottom: "1px solid #eee", whiteSpace: "nowrap", verticalAlign: "top" };
@@ -11,6 +11,8 @@ const tab = (on: boolean): CSSProperties => ({
 });
 
 const DAY = 86_400_000;
+const TIERS: Tier[] = ["free", "basic", "pro", "master"];
+const TIER_NAMES: Record<Tier, string> = { free: "Free", basic: "Basic", pro: "Pro", master: "Master" };
 const fmtBytes = (n: number) => (n < 1024 * 1024 ? `${Math.round(n / 1024)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`);
 const fmtDate = (t: number) => (t ? new Date(t).toLocaleString() : "never");
 const fmtDay = (t: number) => new Date(t).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
@@ -20,15 +22,23 @@ const ACTIONS: Record<string, string> = {
   "gm.paid": "Marked paid",
   "gm.unpaid": "Marked unpaid",
   "gm.expired": "Paid period ended (automatic)",
+  "gm.tier": "Changed tier",
   "gm.password_reset": "Password reset by admin",
   "gm.password_changed": "Changed own password",
   "gm.deleted": "Account deleted",
+  "player.removed": "GM removed a player",
+  "settings.tiers": "Changed tier limits",
   "admin.login": "Admin signed in",
   "login.lockout": "Sign-in locked (too many failures)",
-  "player.removed": "GM removed a player",
 };
 
 type Res = { ok?: boolean; error?: string; password?: string };
+type Draft = Record<Tier, { maxMaps: string; storageMb: string }>;
+
+const toDraft = (t: Record<Tier, TierSetting>): Draft =>
+  Object.fromEntries(
+    TIERS.map((k) => [k, { maxMaps: String(t[k].maxMaps), storageMb: String(t[k].storageMb) }])
+  ) as Draft;
 
 function statusOf(r: GmRow) {
   if (r.paid) return { label: "Paid", color: "#1a7f37" };
@@ -47,9 +57,12 @@ function untilText(r: GmRow) {
 const expiringSoon = (r: GmRow) => r.paid && r.paidUntil !== null && r.paidUntil - Date.now() <= 7 * DAY;
 
 export default function AdminPanel({ init }: { init: AdminInit }) {
-  const [view, setView] = useState<"gms" | "log">("gms");
+  const [view, setView] = useState<"gms" | "tiers" | "log">("gms");
   const [rows, setRows] = useState<GmRow[]>(init.gms);
   const [log, setLog] = useState<LogEntry[]>(init.log);
+  const [limits, setLimits] = useState<Record<Tier, TierSetting>>(init.settings.tiers);
+  const [draft, setDraft] = useState<Draft>(() => toDraft(init.settings.tiers));
+  const [saved, setSaved] = useState("");
   const [q, setQ] = useState("");
   const [logQ, setLogQ] = useState("");
   const [filter, setFilter] = useState<"all" | "paid" | "unpaid" | "soon">("all");
@@ -63,17 +76,23 @@ export default function AdminPanel({ init }: { init: AdminInit }) {
       setRows((all) => (all.some((x) => x.id === r.id) ? all.map((x) => (x.id === r.id ? r : x)) : [r, ...all]));
     const removed = (id: string) => setRows((all) => all.filter((x) => x.id !== id));
     const onLog = (e: LogEntry) => setLog((all) => [...all, e].slice(-500));
+    const onSettings = (s: { tiers: Record<Tier, TierSetting> }) => {
+      setLimits(s.tiers);
+      setDraft(toDraft(s.tiers));
+    };
     socket.on("adminGm", upsert);
     socket.on("adminGms", setRows);
     socket.on("adminGmRemoved", removed);
     socket.on("adminLog", onLog);
     socket.on("adminLogs", setLog);
+    socket.on("adminSettings", onSettings);
     return () => {
       socket.off("adminGm", upsert);
       socket.off("adminGms", setRows);
       socket.off("adminGmRemoved", removed);
       socket.off("adminLog", onLog);
       socket.off("adminLogs", setLog);
+      socket.off("adminSettings", onSettings);
     };
   }, []);
 
@@ -112,6 +131,18 @@ export default function AdminPanel({ init }: { init: AdminInit }) {
     run(r.id, "adminDeleteGm", { id: r.id, confirm: typed });
   };
 
+  const saveLimits = () => {
+    setError("");
+    setSaved("");
+    const tiers = Object.fromEntries(
+      TIERS.map((t) => [t, { maxMaps: Number(draft[t].maxMaps), storageMb: Number(draft[t].storageMb) }])
+    );
+    socket.emit("adminSaveSettings", { tiers }, (res: Res) => {
+      if (res?.ok) setSaved("Saved");
+      else setError(res?.error ?? "Could not save");
+    });
+  };
+
   // Accounts that need attention first, newest first inside each group
   const shown = useMemo(() => {
     const term = q.trim().toLowerCase();
@@ -138,7 +169,7 @@ export default function AdminPanel({ init }: { init: AdminInit }) {
   const soonCount = rows.filter(expiringSoon).length;
 
   return (
-    <div style={{ fontFamily: "sans-serif", maxWidth: 1200, margin: "0 auto", padding: 20 }}>
+    <div style={{ fontFamily: "sans-serif", maxWidth: 1300, margin: "0 auto", padding: 20 }}>
       <h2 style={{ marginTop: 0 }}>
         Superadmin{" "}
         <span style={{ fontSize: 13, fontWeight: "normal", color: "#555" }}>
@@ -148,6 +179,7 @@ export default function AdminPanel({ init }: { init: AdminInit }) {
 
       <div style={{ display: "flex", gap: 6, borderBottom: "2px solid #222", marginBottom: 12 }}>
         <button style={tab(view === "gms")} onClick={() => setView("gms")}>GM accounts</button>
+        <button style={tab(view === "tiers")} onClick={() => setView("tiers")}>Tier settings</button>
         <button style={tab(view === "log")} onClick={() => setView("log")}>Activity log</button>
       </div>
 
@@ -190,6 +222,8 @@ export default function AdminPanel({ init }: { init: AdminInit }) {
                 <tr>
                   <th style={th}>Username</th>
                   <th style={th}>Table</th>
+                  <th style={th}>Tier</th>
+                  <th style={th}>Maps</th>
                   <th style={th}>Players</th>
                   <th style={th}>Online</th>
                   <th style={th}>Storage</th>
@@ -202,7 +236,7 @@ export default function AdminPanel({ init }: { init: AdminInit }) {
               <tbody>
                 {shown.length === 0 && (
                   <tr>
-                    <td style={td} colSpan={9}>No GM accounts found.</td>
+                    <td style={td} colSpan={11}>No GM accounts found.</td>
                   </tr>
                 )}
                 {shown.map((r) => {
@@ -211,9 +245,21 @@ export default function AdminPanel({ init }: { init: AdminInit }) {
                     <tr key={r.id}>
                       <td style={td}><b>{r.username}</b></td>
                       <td style={td}>{r.campaign}</td>
+                      <td style={td}>
+                        <select
+                          value={r.tier}
+                          disabled={busy === r.id}
+                          onChange={(e) => run(r.id, "adminSetTier", { id: r.id, tier: e.target.value })}
+                        >
+                          {TIERS.map((t) => (
+                            <option key={t} value={t}>{TIER_NAMES[t]}</option>
+                          ))}
+                        </select>
+                      </td>
+                      <td style={td}>{r.maps} / {limits[r.tier]?.maxMaps ?? "?"}</td>
                       <td style={td}>{r.players}</td>
                       <td style={td}>{r.online}</td>
-                      <td style={td}>{fmtBytes(r.storage)}</td>
+                      <td style={td}>{fmtBytes(r.storage)} / {limits[r.tier]?.storageMb ?? "?"} MB</td>
                       <td style={td}>{fmtDate(r.lastLoginAt)}</td>
                       <td style={{ ...td, color: st.color, fontWeight: 600 }}>{st.label}</td>
                       <td style={{ ...td, color: expiringSoon(r) ? "#b9770e" : undefined }}>{untilText(r)}</td>
@@ -252,6 +298,50 @@ export default function AdminPanel({ init }: { init: AdminInit }) {
             </table>
           </div>
         </>
+      )}
+
+      {view === "tiers" && (
+        <div>
+          <div style={{ fontSize: 13, color: "#555", marginBottom: 10, maxWidth: 640 }}>
+            <b>Max maps</b> is how many maps a GM can keep. <b>Storage</b> is the total size of a GM's uploaded
+            pictures (maps and tokens). Lowering a limit never deletes anything: the GM just cannot add more until
+            they are under the limit. Choose each GM's tier in the GM accounts tab.
+          </div>
+          <table style={{ borderCollapse: "collapse", fontSize: 14 }}>
+            <thead>
+              <tr>
+                <th style={th}>Tier</th>
+                <th style={th}>Max maps</th>
+                <th style={th}>Storage (MB)</th>
+                <th style={th}>GMs</th>
+              </tr>
+            </thead>
+            <tbody>
+              {TIERS.map((t) => (
+                <tr key={t}>
+                  <td style={td}><b>{TIER_NAMES[t]}</b></td>
+                  <td style={td}>
+                    <input
+                      type="number" min={1} max={1000} style={{ width: 80 }} value={draft[t].maxMaps}
+                      onChange={(e) => setDraft((d) => ({ ...d, [t]: { ...d[t], maxMaps: e.target.value } }))}
+                    />
+                  </td>
+                  <td style={td}>
+                    <input
+                      type="number" min={10} max={100000} style={{ width: 100 }} value={draft[t].storageMb}
+                      onChange={(e) => setDraft((d) => ({ ...d, [t]: { ...d[t], storageMb: e.target.value } }))}
+                    />
+                  </td>
+                  <td style={td}>{rows.filter((r) => r.tier === t).length}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div style={{ marginTop: 12 }}>
+            <button onClick={saveLimits}>Save tier limits</button>{" "}
+            {saved && <span style={{ color: "#1a7f37" }}>{saved}</span>}
+          </div>
+        </div>
       )}
 
       {view === "log" && (

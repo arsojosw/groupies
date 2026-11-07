@@ -3,11 +3,22 @@ import path from "path";
 import { randomBytes, createHash, scrypt, timingSafeEqual, randomUUID } from "crypto";
 
 export type Role = "gm" | "player" | "admin";
+export type Tier = "free" | "basic" | "pro" | "master";
+export const TIERS: Tier[] = ["free", "basic", "pro", "master"];
+export type TierSetting = { maxMaps: number; storageMb: number };
+export const DEFAULT_TIERS: Record<Tier, TierSetting> = {
+  free: { maxMaps: 5, storageMb: 50 },
+  basic: { maxMaps: 20, storageMb: 200 },
+  pro: { maxMaps: 50, storageMb: 500 },
+  master: { maxMaps: 100, storageMb: 1000 },
+};
+
 export type Account = {
   id: string; name: string; role: Role; campaignId: string;
   username?: string; salt?: string; hash?: string; // GM and admin accounts have a password
   paid?: boolean; // GM accounts only: false = cannot use the site
   paidUntil?: number; // GM accounts: access ends at this time (empty = no end date)
+  tier?: Tier; // GM accounts: decides how many maps and how much storage
   createdAt?: number; lastLoginAt?: number;
 };
 export type Token = {
@@ -24,12 +35,28 @@ export type Invite = {
   code: string; expiresAt: number; maxUses: number; uses: number;
   usedBy?: { id: string; name: string; ts: number }[];
 };
-export type MapInfo = { image?: string; w: number; h: number };
 export type Asset = { file: string; size: number };
+
+// One map with its own tokens
+export type SceneMap = {
+  id: string; name: string; image?: string; thumb?: string; w: number; h: number;
+  tokens: Record<string, Token>; createdAt: number;
+};
+
+// A token kept in the GM's library. It can be placed on any map.
+export type SavedToken = {
+  id: string; label: string; color: string; size: number; maxHp: number;
+  image?: string; rot?: number; flip?: boolean; ownerId?: string | null; savedAt: number;
+  fromTokenId?: string; // the map token this entry was made from and stays in step with
+};
+
 export type Campaign = {
   id: string; name: string; gmId: string; memberIds: string[];
-  tokens: Record<string, Token>; messages: Msg[]; invites: Invite[];
-  map: MapInfo; assets: Record<string, Asset>;
+  messages: Msg[]; invites: Invite[]; assets: Record<string, Asset>;
+  maps: Record<string, SceneMap>; activeMapId: string; library: SavedToken[];
+  // The open map and its tokens: always the active map. Set up by bindCampaign, never saved on their own.
+  readonly map: SceneMap;
+  readonly tokens: Record<string, Token>;
 };
 export type LogEntry = { id: string; ts: number; actor: string; action: string; target?: string; detail?: string };
 type DB = {
@@ -37,10 +64,26 @@ type DB = {
   sessions: Record<string, { accountId: string; expiresAt: number }>;
   campaigns: Record<string, Campaign>;
   log: LogEntry[];
+  settings: { tiers: Record<Tier, TierSetting> };
 };
 
 const FILE = path.join(process.cwd(), "data.json");
-export const db: DB = { accounts: {}, sessions: {}, campaigns: {}, log: [] };
+export const db: DB = {
+  accounts: {}, sessions: {}, campaigns: {}, log: [],
+  settings: { tiers: { ...DEFAULT_TIERS } },
+};
+
+// campaign.map and campaign.tokens always point at the open map, so the rest of the server code
+// keeps working on "the map in play". They are not enumerable, so they are not saved twice.
+export function bindCampaign(c: Campaign) {
+  Object.defineProperty(c, "map", { get: () => c.maps[c.activeMapId], enumerable: false, configurable: true });
+  Object.defineProperty(c, "tokens", {
+    get: () => c.maps[c.activeMapId].tokens, enumerable: false, configurable: true,
+  });
+}
+
+export const tierSetting = (gm?: Account): TierSetting =>
+  db.settings.tiers[gm?.tier ?? "free"] ?? DEFAULT_TIERS.free;
 
 export async function loadDb() {
   try {
@@ -52,17 +95,40 @@ export async function loadDb() {
     }
   }
   db.log ??= [];
+  db.settings ??= { tiers: { ...DEFAULT_TIERS } };
+  db.settings.tiers ??= { ...DEFAULT_TIERS };
+  for (const t of TIERS) db.settings.tiers[t] = { ...DEFAULT_TIERS[t], ...db.settings.tiers[t] };
+
   const now = Date.now();
   for (const [k, s] of Object.entries(db.sessions)) if (s.expiresAt < now) delete db.sessions[k];
+
   for (const c of Object.values(db.campaigns)) {
-    c.map ??= { w: 2000, h: 2000 };
+    // Older data kept one map and its tokens directly on the campaign: that becomes "Map 1"
+    const old = c as unknown as { map?: { image?: string; w?: number; h?: number }; tokens?: Record<string, Token> };
+    if (!c.maps || Object.keys(c.maps).length === 0) {
+      const id = randomUUID();
+      c.maps = {
+        [id]: {
+          id, name: "Map 1", image: old.map?.image, w: old.map?.w ?? 2000, h: old.map?.h ?? 2000,
+          tokens: old.tokens ?? {}, createdAt: now,
+        },
+      };
+      c.activeMapId = id;
+    }
+    if (!c.maps[c.activeMapId]) c.activeMapId = Object.keys(c.maps)[0];
+    delete old.map;
+    delete old.tokens;
+    c.library ??= [];
     c.assets ??= {};
+    bindCampaign(c);
   }
-  // GM accounts created before the paid flag existed keep their access
+
+  // GM accounts created before the paid flag and tiers existed keep their access, on the Free tier
   for (const a of Object.values(db.accounts)) {
     if (a.role === "gm") {
       a.paid ??= true;
       a.createdAt ??= now;
+      a.tier ??= "free";
     }
   }
 }
@@ -136,7 +202,7 @@ export async function setPassword(acc: Account, password: string) {
 
 const nameTaken = (u: string) => Object.values(db.accounts).some((a) => a.username === u);
 
-// New GM accounts start as NOT paid: the superadmin activates them
+// New GM accounts start as NOT paid and on the Free tier: the superadmin activates them
 export async function createGm(username: string, password: string, campaignName: string) {
   const uname = username.trim().toLowerCase();
   if (!/^[a-z0-9_]{3,20}$/.test(uname)) return { error: "Username: 3-20 letters, numbers or _" };
@@ -147,15 +213,19 @@ export async function createGm(username: string, password: string, campaignName:
   if (nameTaken(uname)) return { error: "Username already taken" };
   const accId = randomUUID();
   const campId = randomUUID();
+  const mapId = randomUUID();
   db.accounts[accId] = {
     id: accId, name: uname, role: "gm", campaignId: campId, username: uname, salt, hash,
-    paid: false, createdAt: Date.now(),
+    paid: false, tier: "free", createdAt: Date.now(),
   };
-  db.campaigns[campId] = {
+  const camp = {
     id: campId, name: campaignName.trim().slice(0, 40) || `${uname}'s table`,
-    gmId: accId, memberIds: [], tokens: {}, messages: [], invites: [],
-    map: { w: 2000, h: 2000 }, assets: {},
-  };
+    gmId: accId, memberIds: [], messages: [], invites: [], assets: {},
+    maps: { [mapId]: { id: mapId, name: "Map 1", w: 2000, h: 2000, tokens: {}, createdAt: Date.now() } },
+    activeMapId: mapId, library: [],
+  } as unknown as Campaign;
+  bindCampaign(camp);
+  db.campaigns[campId] = camp;
   save();
   return { account: db.accounts[accId] };
 }
@@ -219,6 +289,7 @@ export function listInvites(camp: Campaign) {
   camp.invites = camp.invites.filter((i) => i.expiresAt > cutoff);
   return camp.invites;
 }
+
 export function findInvite(code: unknown) {
   if (typeof code !== "string") return null;
   for (const camp of Object.values(db.campaigns)) {

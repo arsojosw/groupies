@@ -42,25 +42,32 @@ export async function prepareMap(file: File) {
 
 // Token: crop the middle square and keep up to 512 x 512 (never enlarged).
 // Saved as WebP where the browser supports it, otherwise PNG.
+// Token: keep the WHOLE picture. It is placed in the middle of a square (transparent space if the
+// picture is not square), up to 512 x 512, never enlarged. WebP where the browser supports it, else PNG.
 export async function prepareToken(file: File) {
   const img = await loadImage(file);
-  const side = Math.min(img.naturalWidth, img.naturalHeight);
-  if (!side) throw new Error("Unsupported image");
-  const out = Math.min(side, 512);
+  const w0 = img.naturalWidth;
+  const h0 = img.naturalHeight;
+  if (!w0 || !h0) throw new Error("Unsupported image");
+  const longest = Math.max(w0, h0);
+  const side = Math.min(longest, 512);
+  const scale = side / longest; // 1 or smaller
+  const dw = Math.round(w0 * scale);
+  const dh = Math.round(h0 * scale);
   const canvas = document.createElement("canvas");
-  canvas.width = out;
-  canvas.height = out;
+  canvas.width = side;
+  canvas.height = side;
   const ctx = canvas.getContext("2d");
   if (!ctx) throw new Error("Could not process image");
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
-  ctx.drawImage(img, (img.naturalWidth - side) / 2, (img.naturalHeight - side) / 2, side, side, 0, 0, out, out);
+  ctx.drawImage(img, (side - dw) / 2, (side - dh) / 2, dw, dh);
   return toBlob(canvas, "image/webp", 0.92);
 }
 
 // Returns an error message, or null when the upload worked
 export async function upload(
-  kind: "map" | "token",
+  kind: "map" | "token" | "thumb",
   blob: Blob,
   params: Record<string, string | number>
 ): Promise<string | null> {
@@ -77,4 +84,25 @@ export async function upload(
   } catch {
     return "Upload failed. Check your connection.";
   }
+}
+
+// Small preview of a map picture that is already uploaded (about 240 px, a few KB)
+export async function prepareThumb(url: string): Promise<Blob> {
+  const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+    const i = new Image();
+    i.onload = () => resolve(i);
+    i.onerror = () => reject(new Error("Could not load the map picture"));
+    i.src = url;
+  });
+  const w0 = img.naturalWidth;
+  const h0 = img.naturalHeight;
+  if (!w0 || !h0) throw new Error("Unsupported image");
+  const scale = Math.min(1, 240 / Math.max(w0, h0));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(w0 * scale));
+  canvas.height = Math.max(1, Math.round(h0 * scale));
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Could not process image");
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  return toBlob(canvas, "image/jpeg", 0.7);
 }

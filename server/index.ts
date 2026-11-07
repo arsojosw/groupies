@@ -8,26 +8,31 @@ import type { Socket } from "socket.io";
 import {
   db, loadDb, save, newSession, accountFromSession, endSession,
   createGm, checkLogin, createPlayer, ensureAdmin, activeInvites, listInvites, findInvite,
-  setPassword, purgeOrphanSessions, logEvent,
+  setPassword, purgeOrphanSessions, logEvent, tierSetting, TIERS,
 } from "./store";
-import type { Account, Campaign, Msg, Token } from "./store";
+import type { Account, Campaign, Msg, Role, SceneMap, Tier, Token } from "./store";
+
 
 const app = express();
 const httpServer = createServer(app);
 const io = new Server(httpServer, { cors: { origin: "*" } });
 
 const CELL = 40;
-const MAX_TOKENS = 50;
+const MAX_TOKENS = 50; // tokens on one map
+const MAX_LIBRARY = 200; // saved tokens
 const MIN_MAP = 400;
 const MAX_MAP = 4000;
 const MAX_MAP_BYTES = 6 * 1024 * 1024;
 const MAX_TOKEN_BYTES = 2 * 1024 * 1024;
-const QUOTA_BYTES = 50 * 1024 * 1024; // per table
+const MAX_THUMB_BYTES = 300 * 1024; // map previews are small
 const UPLOAD_DIR = path.join(process.cwd(), "uploads");
 const COLORS = ["#378ADD", "#D85A30", "#2ecc71", "#f1c40f", "#9b59b6", "#1abc9c", "#e84393", "#e67e22"];
+
 // Token actions (the buttons that appear when a token is selected)
-const ACTION_LABELS: Record<string, string> = { sword: "Melee Attack" };
-const MELEE_STOP_AT_CONTACT = true; // the source stops where its edge touches the edge of the target
+const ACTION_LABELS: Record<string, string> = { sword: "Melee Attack", bow: "Ranged Attack" };
+const AMMO = ["arrow", "gun"]; // ammo types the Ranged Attack accepts
+const RANGED_HIT_CENTER = false; // false: the shot ends where it touches the target's edge; true: at its center
+const MELEE_STOP_AT_CONTACT = true; // the attacker stops where its edge touches the edge of the target
 
 type Cb = (res: Record<string, unknown>) => void;
 
@@ -37,6 +42,7 @@ const playerRoom = (c: Campaign) => `pl:${c.id}`;
 const acctRoom = (id: string) => `acct:${id}`;
 const everyone = (c: Campaign) => [gmRoom(c), playerRoom(c)];
 const assetUrl = (c: Campaign, file: string) => `/uploads/${c.id}/${file}`;
+const cleanName = (v: unknown, fallback: string) => String(v ?? "").trim().slice(0, 40) || fallback;
 
 // Writes to the activity log and shows the entry live in the admin page
 function record(actor: string, action: string, target?: string, detail?: string) {
@@ -122,8 +128,8 @@ function forPlayers(t: Token) {
 }
 
 // Players never receive hidden tokens at all
-function tokensFor(camp: Campaign, acc: Account) {
-  if (acc.role === "gm") return camp.tokens;
+function tokensFor(camp: Campaign, role: Role) {
+  if (role === "gm") return camp.tokens;
   return Object.fromEntries(
     Object.entries(camp.tokens)
       .filter(([, t]) => !t.hidden)
@@ -187,23 +193,97 @@ function postMsg(camp: Campaign, acc: Account, part: Pick<Msg, "to" | "kind" | "
   io.to(rooms).emit("chat", msg);
 }
 
+// ---------- maps and library ----------
+// What players need to know about the open map (never include its tokens here)
+const mapInfo = (camp: Campaign) => ({
+  id: camp.map.id, name: camp.map.name, image: camp.map.image, w: camp.map.w, h: camp.map.h,
+});
+
+const mapList = (camp: Campaign) =>
+  Object.values(camp.maps)
+    .sort((a, b) => a.createdAt - b.createdAt)
+    .map((m) => ({ id: m.id, name: m.name, w: m.w, h: m.h, image: m.image, thumb: m.thumb }));
+
+
+// A saved token made from a map token stays in step with it (name, picture, size...)
+function syncLibrary(camp: Campaign, t: Token) {
+  const s = camp.library.find((x) => x.fromTokenId === t.id);
+  if (!s) return;
+  s.label = t.label;
+  s.color = t.color;
+  s.size = t.size;
+  s.maxHp = t.maxHp;
+  s.image = t.image;
+  s.rot = t.rot;
+  s.flip = t.flip;
+  s.ownerId = t.ownerId;
+  save();
+  io.to(gmRoom(camp)).emit("library", camp.library);
+}
+
+// Copy a token into the library. Saving the same token again just updates its entry.
+function saveToLibrary(camp: Campaign, t: Token): boolean {
+  if (camp.library.some((x) => x.fromTokenId === t.id)) {
+    syncLibrary(camp, t);
+    return true;
+  }
+  if (camp.library.length >= MAX_LIBRARY) return false;
+  camp.library.push({
+    id: randomUUID(), label: t.label, color: t.color, size: t.size, maxHp: t.maxHp,
+    image: t.image, rot: t.rot, flip: t.flip, ownerId: t.ownerId, savedAt: Date.now(), fromTokenId: t.id,
+  });
+  save();
+  io.to(gmRoom(camp)).emit("library", camp.library);
+  return true;
+}    
+
+function tierInfo(camp: Campaign) {
+  const gm = db.accounts[camp.gmId];
+  const t = tierSetting(gm);
+  return {
+    tier: gm?.tier ?? "free",
+    maxMaps: t.maxMaps,
+    mapCount: Object.keys(camp.maps).length,
+    storageMb: t.storageMb,
+    usedBytes: Object.values(camp.assets).reduce((s, a) => s + a.size, 0),
+  };
+}
+
+// The GM's map list, open map and tier numbers
+function sendMaps(camp: Campaign) {
+  io.to(gmRoom(camp)).emit("maps", { activeMapId: camp.activeMapId, maps: mapList(camp), tier: tierInfo(camp) });
+}
+
+// Everyone gets the open map and its tokens (players without hidden tokens)
+function broadcastScene(camp: Campaign) {
+  io.to(gmRoom(camp)).emit("scene", { map: mapInfo(camp), tokens: tokensFor(camp, "gm") });
+  io.to(playerRoom(camp)).emit("scene", { map: mapInfo(camp), tokens: tokensFor(camp, "player") });
+}
+
 function sendInit(socket: Socket, acc: Account, camp: Campaign) {
   socket.emit("init", {
     me: { id: acc.id, name: acc.name, role: acc.role },
     campaign: { name: camp.name },
-    map: camp.map,
+    map: mapInfo(camp),
     members: membersOf(camp),
-    tokens: tokensFor(camp, acc),
+    tokens: tokensFor(camp, acc.role),
     messages: camp.messages.filter((m) => canSee(m, acc.id)).slice(-50),
-     invites: acc.role === "gm" ? listInvites(camp) : undefined,
+    invites: acc.role === "gm" ? listInvites(camp) : undefined,
+    ...(acc.role === "gm"
+      ? { library: camp.library, maps: mapList(camp), activeMapId: camp.activeMapId, tier: tierInfo(camp) }
+      : {}),
   });
 }
 
-// Delete uploaded files that nothing uses any more
+// Delete uploaded files that no map, token or saved token uses any more
 function gcAssets(camp: Campaign) {
   const used = new Set<string>();
-  if (camp.map.image) used.add(camp.map.image);
-  for (const t of Object.values(camp.tokens)) if (t.image) used.add(t.image);
+  for (const m of Object.values(camp.maps)) {
+    if (m.image) used.add(m.image);
+    if (m.thumb) used.add(m.thumb);
+    for (const t of Object.values(m.tokens)) if (t.image) used.add(t.image);
+  }
+  for (const s of camp.library) if (s.image) used.add(s.image);
   for (const [key, a] of Object.entries(camp.assets)) {
     if (used.has(assetUrl(camp, a.file))) continue;
     delete camp.assets[key];
@@ -212,15 +292,15 @@ function gcAssets(camp: Campaign) {
   save();
 }
 
-// After the map shrinks, pull tokens back inside it
-function fitTokens(camp: Campaign) {
-  for (const t of Object.values(camp.tokens)) {
-    const x = clamp(t.x, 0, camp.map.w - t.size * CELL);
-    const y = clamp(t.y, 0, camp.map.h - t.size * CELL);
+// After a map shrinks, pull its tokens back inside it (only the open map's changes are sent to players)
+function fitTokens(camp: Campaign, m: SceneMap = camp.map) {
+  for (const t of Object.values(m.tokens)) {
+    const x = clamp(t.x, 0, m.w - t.size * CELL);
+    const y = clamp(t.y, 0, m.h - t.size * CELL);
     if (x !== t.x || y !== t.y) {
       t.x = x;
       t.y = y;
-      emitToken(camp, "tokenUpdated", t);
+      if (m.id === camp.activeMapId) emitToken(camp, "tokenUpdated", t);
     }
   }
 }
@@ -260,6 +340,8 @@ function gmRow(a: Account) {
     online: camp ? (rooms.get(gmRoom(camp))?.size ?? 0) + (rooms.get(playerRoom(camp))?.size ?? 0) : 0,
     paid: a.paid === true,
     paidUntil: a.paidUntil ?? null,
+    tier: a.tier ?? "free",
+    maps: camp ? Object.keys(camp.maps).length : 0,
     createdAt: a.createdAt ?? 0,
     lastLoginAt: a.lastLoginAt ?? 0,
     storage: camp ? Object.values(camp.assets).reduce((s, x) => s + x.size, 0) : 0,
@@ -314,6 +396,7 @@ function sendAdminInit(socket: Socket, acc: Account) {
     me: { id: acc.id, name: acc.name },
     gms: allGmRows(),
     log: db.log.slice(-300),
+    settings: db.settings,
   });
 }
 
@@ -359,6 +442,47 @@ function setupAdmin(socket: Socket, acc: Account) {
     io.to("admin").emit("adminGm", gmRow(gm));
     cb?.({ ok: true });
   });
+
+  // GM tier: decides the number of maps and the storage
+  socket.on("adminSetTier", (p: { id?: string; tier?: string }, cb?: Cb) => {
+    const gm = findGm(p?.id);
+    if (!gm) return cb?.({ error: "GM account not found" });
+    if (!TIERS.includes(p.tier as Tier)) return cb?.({ error: "Unknown tier" });
+    const before = gm.tier ?? "free";
+    gm.tier = p.tier as Tier;
+    save();
+    record(acc.name, "gm.tier", gm.username, `${before} -> ${gm.tier}`);
+    io.to("admin").emit("adminGm", gmRow(gm));
+    const camp = db.campaigns[gm.campaignId];
+    if (camp) sendMaps(camp); // the GM sees the new limits at once
+    cb?.({ ok: true });
+  });
+
+  // Limits of each tier
+  socket.on(
+    "adminSaveSettings",
+    (p: { tiers?: Record<string, { maxMaps?: unknown; storageMb?: unknown }> }, cb?: Cb) => {
+      const next = { ...db.settings.tiers };
+      for (const t of TIERS) {
+        const v = p?.tiers?.[t];
+        if (!v) continue;
+        const maxMaps = Math.round(Number(v.maxMaps));
+        const storageMb = Math.round(Number(v.storageMb));
+        if (!(maxMaps >= 1 && maxMaps <= 1000)) return cb?.({ error: `${t}: maps must be between 1 and 1000` });
+        if (!(storageMb >= 10 && storageMb <= 100000)) return cb?.({ error: `${t}: storage must be 10 to 100000 MB` });
+        next[t] = { maxMaps, storageMb };
+      }
+      db.settings.tiers = next;
+      save();
+      record(
+        acc.name, "settings.tiers", undefined,
+        TIERS.map((t) => `${t}: ${next[t].maxMaps} maps, ${next[t].storageMb} MB`).join(" | ")
+      );
+      io.to("admin").emit("adminSettings", db.settings);
+      for (const c of Object.values(db.campaigns)) sendMaps(c);
+      cb?.({ ok: true });
+    }
+  );
 
   // New random password, shown to the admin once
   socket.on("adminResetPassword", async (p: { id?: string }, cb?: Cb) => {
@@ -408,24 +532,30 @@ app.post("/api/upload", express.raw({ type: () => true, limit: "6mb" }), async (
     if (!Buffer.isBuffer(body) || body.length === 0) return void res.status(400).json({ error: "Empty upload" });
 
     const kind = String(req.query.kind);
-    if (kind !== "map" && kind !== "token") return void res.status(400).json({ error: "Unknown upload type" });
+    if (kind !== "map" && kind !== "token" && kind !== "thumb") {
+      return void res.status(400).json({ error: "Unknown upload type" });
+    }
     const ext = sniff(body);
     if (!ext) return void res.status(415).json({ error: "Use a PNG, JPG or WebP image" });
-    if (body.length > (kind === "map" ? MAX_MAP_BYTES : MAX_TOKEN_BYTES)) {
-      return void res.status(413).json({ error: "Image is too large" });
-    }
+    const maxBytes = kind === "map" ? MAX_MAP_BYTES : kind === "thumb" ? MAX_THUMB_BYTES : MAX_TOKEN_BYTES;
+    if (body.length > maxBytes) return void res.status(413).json({ error: "Image is too large" });
 
     const tok = kind === "token" ? camp.tokens[String(req.query.tokenId)] : undefined;
     if (kind === "token" && !tok) return void res.status(404).json({ error: "Token not found" });
+    // Map pictures and previews can be set for any map (default: the open one)
+    const mapId = req.query.mapId === undefined ? camp.activeMapId : String(req.query.mapId);
+    const target = kind === "map" || kind === "thumb" ? camp.maps[mapId] : undefined;
+    if ((kind === "map" || kind === "thumb") && !target) return void res.status(404).json({ error: "Map not found" });
 
-    // Storage limit (the image being replaced does not count)
-    const replacedUrl = kind === "map" ? camp.map.image : tok?.image;
+    // Storage limit of the GM's tier (the image being replaced does not count)
+    const quotaMb = tierSetting(acc).storageMb;
+    const replacedUrl = kind === "map" ? target?.image : kind === "thumb" ? target?.thumb : tok?.image;
     const used = Object.values(camp.assets).reduce(
       (sum, a) => sum + (replacedUrl === assetUrl(camp, a.file) ? 0 : a.size),
       0
     );
-    if (used + body.length > QUOTA_BYTES) {
-      return void res.status(413).json({ error: "Storage full (50 MB). Remove some images first." });
+    if (used + body.length > quotaMb * 1024 * 1024) {
+      return void res.status(413).json({ error: `Storage full (${quotaMb} MB). Remove some images or ask for a higher tier.` });
     }
 
     const file = `${randomBytes(16).toString("hex")}.${ext}`;
@@ -434,19 +564,22 @@ app.post("/api/upload", express.raw({ type: () => true, limit: "6mb" }), async (
     camp.assets[file] = { file, size: body.length };
     const url = assetUrl(camp, file);
 
-    if (kind === "map") {
-      camp.map = {
-        image: url,
-        w: clamp(Math.round(Number(req.query.w)) || 2000, MIN_MAP, MAX_MAP),
-        h: clamp(Math.round(Number(req.query.h)) || 2000, MIN_MAP, MAX_MAP),
-      };
-      fitTokens(camp);
-      io.to(everyone(camp)).emit("map", camp.map);
+    if (kind === "map" && target) {
+      target.image = url;
+      target.thumb = undefined; // the GM's browser makes a new preview
+      target.w = clamp(Math.round(Number(req.query.w)) || 2000, MIN_MAP, MAX_MAP);
+      target.h = clamp(Math.round(Number(req.query.h)) || 2000, MIN_MAP, MAX_MAP);
+      fitTokens(camp, target);
+      if (target.id === camp.activeMapId) io.to(everyone(camp)).emit("map", mapInfo(camp));
+    } else if (kind === "thumb" && target) {
+      target.thumb = url;
     } else if (tok) {
       tok.image = url;
+      syncLibrary(camp, tok);
       emitToken(camp, "tokenUpdated", tok);
     }
     gcAssets(camp);
+    sendMaps(camp);
     res.json({ ok: true });
   } catch (e) {
     console.error("upload failed", e);
@@ -474,7 +607,7 @@ io.on("connection", (socket) => {
     if (typeof cb !== "function") return;
     if (!allow(socket, "auth", 5, 60_000)) return cb({ error: "Too many attempts, wait a minute" });
     const res = await createGm(String(p?.username ?? ""), String(p?.password ?? ""), String(p?.campaignName ?? ""));
-        if ("error" in res) return cb({ error: res.error });
+    if ("error" in res) return cb({ error: res.error });
     res.account.lastLoginAt = Date.now();
     record(res.account.name, "gm.registered", res.account.name, `Table: ${db.campaigns[res.account.campaignId]?.name ?? ""}`);
     io.to("admin").emit("adminGm", gmRow(res.account));
@@ -489,7 +622,7 @@ io.on("connection", (socket) => {
       return cb({ error: "Too many failed attempts for this account. Try again in 15 minutes." });
     }
     const found = await checkLogin(uname, String(p?.password ?? ""));
-        if (!found) {
+    if (!found) {
       noteFail(uname);
       if (recentFails(uname) === FAIL_LIMIT) {
         record("system", "login.lockout", uname, "Too many failed sign-ins: blocked for 15 minutes");
@@ -532,7 +665,7 @@ io.on("connection", (socket) => {
     save();
     emitToken(camp, "tokenAdded", camp.tokens[id]);
     io.to(everyone(camp)).emit("members", membersOf(camp));
-        io.to(gmRoom(camp)).emit("invites", listInvites(camp));
+    io.to(gmRoom(camp)).emit("invites", listInvites(camp));
     cb({ ok: true, session: newSession(player.id) });
   });
 
@@ -571,7 +704,7 @@ io.on("connection", (socket) => {
   socket.join([acctRoom(acc.id), isGm ? gmRoom(camp) : playerRoom(camp)]);
   sendInit(socket, acc, camp);
 
-    // GM: change own password (the current session stays valid, other devices are signed out)
+  // GM: change own password (the current session stays valid, other devices are signed out)
   socket.on("changePassword", async (p: { current?: string; next?: string }, cb?: Cb) => {
     if (!isGm || typeof cb !== "function") return;
     if (!allow(socket, "pw", 5, 60_000)) return cb({ error: "Too many attempts, wait a minute" });
@@ -583,6 +716,7 @@ io.on("connection", (socket) => {
     record(acc.name, "gm.password_changed", acc.username);
     cb({ ok: true, session: newSession(acc.id) });
   });
+
   // GM: invite links
   socket.on("createInvite", (p: { hours?: number; maxUses?: number }, cb?: Cb) => {
     if (!isGm) return;
@@ -591,7 +725,7 @@ io.on("connection", (socket) => {
     if (activeInvites(camp).length >= 10) return cb?.({ error: "Too many active links. Revoke one first." });
     camp.invites.push({ code: randomBytes(9).toString("base64url"), expiresAt: Date.now() + hours * 3_600_000, maxUses, uses: 0 });
     save();
-        io.to(gmRoom(camp)).emit("invites", listInvites(camp));
+    io.to(gmRoom(camp)).emit("invites", listInvites(camp));
     cb?.({ ok: true });
   });
 
@@ -599,21 +733,24 @@ io.on("connection", (socket) => {
     if (!isGm) return;
     camp.invites = camp.invites.filter((i) => i.code !== code);
     save();
-        io.to(gmRoom(camp)).emit("invites", listInvites(camp));
+    io.to(gmRoom(camp)).emit("invites", listInvites(camp));
   });
 
-    // GM: remove a player. Their tokens stay on the map and go back to the GM.
+  // GM: remove a player. Their tokens stay on the maps and go back to the GM.
   socket.on("removePlayer", async (p: { id?: string }) => {
     if (!isGm || typeof p?.id !== "string" || !camp.memberIds.includes(p.id)) return;
     const id = p.id;
     const playerName = db.accounts[id]?.name ?? "?";
     camp.memberIds = camp.memberIds.filter((m) => m !== id);
-    for (const t of Object.values(camp.tokens)) {
-      if (t.ownerId === id) {
+    // Tokens on every map, and saved tokens, go back to the GM
+    for (const m of Object.values(camp.maps)) {
+      for (const t of Object.values(m.tokens)) {
+        if (t.ownerId !== id) continue;
         t.ownerId = null;
-        emitToken(camp, "tokenUpdated", t); // players now see it as a GM token
+        if (m.id === camp.activeMapId) emitToken(camp, "tokenUpdated", t); // players now see it as a GM token
       }
     }
+    for (const s of camp.library) if (s.ownerId === id) s.ownerId = null;
     delete db.accounts[id];
     purgeOrphanSessions();
     save();
@@ -624,27 +761,116 @@ io.on("connection", (socket) => {
       s.disconnect(true);
     }
     io.to(everyone(camp)).emit("members", membersOf(camp));
+    io.to(gmRoom(camp)).emit("library", camp.library);
     record(acc.name, "player.removed", acc.name, `Removed player ${playerName}`);
   });
-  // GM: map settings (the image itself arrives through /api/upload)
-  socket.on("setMap", (p: { w?: number; h?: number }) => {
-    if (!isGm || !p) return;
-    camp.map.w = clamp(Math.round(Number(p.w)) || camp.map.w, MIN_MAP, MAX_MAP);
-    camp.map.h = clamp(Math.round(Number(p.h)) || camp.map.h, MIN_MAP, MAX_MAP);
-    fitTokens(camp);
+
+    // GM: size of a map (the open one if no id is given)
+  socket.on("setMap", (p: { id?: string; w?: number; h?: number }) => {
+    const m = p && typeof p.id === "string" ? camp.maps[p.id] : camp.map;
+    if (!isGm || !p || !m) return;
+    m.w = clamp(Math.round(Number(p.w)) || m.w, MIN_MAP, MAX_MAP);
+    m.h = clamp(Math.round(Number(p.h)) || m.h, MIN_MAP, MAX_MAP);
+    fitTokens(camp, m);
     save();
-    io.to(everyone(camp)).emit("map", camp.map);
+    if (m.id === camp.activeMapId) io.to(everyone(camp)).emit("map", mapInfo(camp));
+    sendMaps(camp);
   });
 
-  socket.on("clearMap", () => {
-    if (!isGm) return;
-    camp.map.image = undefined;
+  // GM: remove the picture of a map (the open one if no id is given)
+  socket.on("clearMap", (id?: string) => {
+    const m = typeof id === "string" ? camp.maps[id] : camp.map;
+    if (!isGm || !m) return;
+    m.image = undefined;
+    m.thumb = undefined;
     gcAssets(camp);
-    io.to(everyone(camp)).emit("map", camp.map);
+    if (m.id === camp.activeMapId) io.to(everyone(camp)).emit("map", mapInfo(camp));
+    sendMaps(camp);
+  });
+
+  // GM: the library of maps
+  socket.on("createMap", (p: { name?: string }, cb?: Cb) => {
+    if (!isGm) return;
+    const limit = tierSetting(acc).maxMaps;
+    const count = Object.keys(camp.maps).length;
+    if (count >= limit) {
+      return cb?.({ error: `Your tier allows ${limit} maps. Delete a map or ask the administrator for a higher tier.` });
+    }
+    const id = randomUUID();
+    camp.maps[id] = { id, name: cleanName(p?.name, `Map ${count + 1}`), w: 2000, h: 2000, tokens: {}, createdAt: Date.now() };
+    save();
+    sendMaps(camp);
+    cb?.({ ok: true });
+  });
+
+  socket.on("renameMap", (p: { id?: string; name?: string }) => {
+    const m = typeof p?.id === "string" ? camp.maps[p.id] : undefined;
+    if (!isGm || !m) return;
+    m.name = cleanName(p.name, m.name);
+    save();
+    sendMaps(camp);
+    if (m.id === camp.activeMapId) io.to(everyone(camp)).emit("map", mapInfo(camp));
+  });
+
+  socket.on("deleteMap", (id: string, cb?: Cb) => {
+    const m = typeof id === "string" ? camp.maps[id] : undefined;
+    if (!isGm || !m) return;
+    if (m.id === camp.activeMapId) return cb?.({ error: "Open another map first, then delete this one." });
+    if (Object.keys(camp.maps).length <= 1) return cb?.({ error: "You need at least one map." });
+    delete camp.maps[id];
+    gcAssets(camp);
+    sendMaps(camp);
+    cb?.({ ok: true });
+  });
+
+  // Everyone switches to this map
+  socket.on("activateMap", (id: string) => {
+    if (!isGm || typeof id !== "string" || !camp.maps[id] || id === camp.activeMapId) return;
+    camp.activeMapId = id;
+    save();
+    broadcastScene(camp);
+    sendMaps(camp);
+  });
+
+  // GM: the library of saved tokens
+  socket.on("saveToken", (p: { id?: string }, cb?: Cb) => {
+    const t = typeof p?.id === "string" ? camp.tokens[p.id] : undefined;
+    if (!isGm || !t) return cb?.({ error: "Token not found" });
+    if (!saveToLibrary(camp, t)) return cb?.({ error: `The library is full (${MAX_LIBRARY} tokens)` });
+    cb?.({ ok: true });
+  });
+
+  // Place a copy of a saved token on the open map (full HP, visible)
+  socket.on("libraryAdd", (p: { id?: string; x?: number; y?: number }) => {
+    const s = camp.library.find((x) => x.id === p?.id);
+    if (!isGm || !s) return;
+    const count = Object.keys(camp.tokens).length;
+    if (count >= MAX_TOKENS) return;
+    const id = randomUUID();
+    const pos = 20 + (count % 10) * 30;
+    const hasPos = typeof p.x === "number" && typeof p.y === "number";
+    camp.tokens[id] = clean(
+      {
+        label: s.label, color: s.color, size: s.size, maxHp: s.maxHp, hp: s.maxHp,
+        image: s.image, rot: s.rot, flip: s.flip, ownerId: s.ownerId ?? null,
+        x: hasPos ? p.x : pos, y: hasPos ? p.y : pos, z: nextZ(camp),
+      },
+      id, camp
+    );
+    save();
+    emitToken(camp, "tokenAdded", camp.tokens[id]);
+  });
+
+  socket.on("libraryDelete", (id: string) => {
+    if (!isGm) return;
+    camp.library = camp.library.filter((s) => s.id !== id);
+    gcAssets(camp);
+    io.to(gmRoom(camp)).emit("library", camp.library);
+    sendMaps(camp);
   });
 
   // GM: tokens
-  socket.on("addToken", (raw: Partial<Token>) => {
+    socket.on("addToken", (raw: Partial<Token> & { save?: boolean }) => {
     if (!isGm || !raw || typeof raw !== "object") return;
     const count = Object.keys(camp.tokens).length;
     if (count >= MAX_TOKENS) return;
@@ -655,6 +881,7 @@ io.on("connection", (socket) => {
       { ...raw, x: hasPos ? raw.x : pos, y: hasPos ? raw.y : pos, z: nextZ(camp) },
       id, camp
     );
+    if (raw.save === true) saveToLibrary(camp, camp.tokens[id]); // also keep it in the library
     save();
     emitToken(camp, "tokenAdded", camp.tokens[id]);
   });
@@ -678,6 +905,7 @@ io.on("connection", (socket) => {
       cur.id, camp
     );
     camp.tokens[cur.id] = next;
+    syncLibrary(camp, next);
     save();
     if (!wasHidden && next.hidden) {
       // Hiding: players lose the token completely
@@ -697,6 +925,7 @@ io.on("connection", (socket) => {
     const t = camp.tokens[id];
     if (!t) return;
     t.image = undefined;
+    syncLibrary(camp, t);
     gcAssets(camp);
     emitToken(camp, "tokenUpdated", t);
   });
@@ -706,7 +935,8 @@ io.on("connection", (socket) => {
     const t = camp.tokens[p?.id];
     if (!t || (!isGm && (t.ownerId !== acc.id || t.hidden))) return;
     if (p.rot !== undefined) t.rot = (((Math.round(Number(p.rot)) || 0) % 360) + 360) % 360;
-    if (p.flip !== undefined) t.flip = p.flip === true;
+   if (p.flip !== undefined) t.flip = p.flip === true;
+    if (isGm) syncLibrary(camp, t);
     save();
     emitToken(camp, "tokenUpdated", t);
   });
@@ -759,8 +989,9 @@ io.on("connection", (socket) => {
     socket.to(t.hidden ? [gmRoom(camp)] : everyone(camp)).emit("moved", { id, x: t.x, y: t.y });
   });
 
-  // A token uses an action on another token. For now: Melee Attack = glide to the target.
-  socket.on("tokenAction", (p: { from?: string; to?: string; action?: string }) => {
+  // A token uses an action on another token.
+  // Melee Attack: the token glides to the target. Ranged Attack: a temporary ammo token flies to the target.
+  socket.on("tokenAction", (p: { from?: string; to?: string; action?: string; ammo?: string }) => {
     if (!allow(socket, "act", 10, 10_000)) return;
     const label = p?.action ? ACTION_LABELS[p.action] : undefined;
     const src = typeof p?.from === "string" ? camp.tokens[p.from] : undefined;
@@ -769,37 +1000,78 @@ io.on("connection", (socket) => {
     // The GM may use any token. A player: only their own, and only against tokens they can see.
     if (!isGm && (src.ownerId !== acc.id || src.hidden || dst.hidden)) return;
 
-    // Straight line: the middle of the source token goes to the middle of the target token
+    // If a hidden token is involved, only the GM sees the move or shot and the chat line
+    const secret = !!src.hidden || !!dst.hidden;
+    const rooms = secret ? [gmRoom(camp)] : everyone(camp);
+
     const sSize = src.size * CELL;
     const dSize = dst.size * CELL;
     const sc = { x: src.x + sSize / 2, y: src.y + sSize / 2 };
     const dc = { x: dst.x + dSize / 2, y: dst.y + dSize / 2 };
-    let goal = dc;
-    if (MELEE_STOP_AT_CONTACT) {
-      const dist = Math.hypot(dc.x - sc.x, dc.y - sc.y);
-      const contact = (sSize + dSize) / 2;
-      goal = dist <= contact
-        ? sc // already touching: stay
-        : { x: dc.x - ((dc.x - sc.x) / dist) * contact, y: dc.y - ((dc.y - sc.y) / dist) * contact };
-    }
-        const x = clamp(goal.x - sSize / 2, 0, camp.map.w - sSize);
-    const y = clamp(goal.y - sSize / 2, 0, camp.map.h - sSize);
-    const moved = Math.hypot(x - src.x, y - src.y);
-    const ms = Math.round(clamp(350 + moved * 1.2, 400, 1500));
-    src.x = x;
-    src.y = y;
-    save();
+    const dist = Math.hypot(dc.x - sc.x, dc.y - sc.y);
 
-    // If a hidden token is involved, only the GM sees the move and the chat line
-    const secret = !!src.hidden || !!dst.hidden;
-    if (moved >= 1) io.to(secret ? [gmRoom(camp)] : everyone(camp)).emit("tween", { id: src.id, x, y, ms });
+    if (p.action === "bow") {
+      // Ranged Attack: the shooter stays. A shot flies from its edge to the edge of the target.
+      const ammo = typeof p.ammo === "string" && AMMO.includes(p.ammo) ? p.ammo : null;
+      if (!ammo) return;
+      const d = dist || 1;
+      const ux = (dc.x - sc.x) / d;
+      const uy = (dc.y - sc.y) / d;
+      const out = sSize / 2; // leaves from the edge of the shooter
+      const hit = RANGED_HIT_CENTER ? 0 : dSize / 2; // ends where it touches the target
+      let sx = sc.x + ux * out;
+      let sy = sc.y + uy * out;
+      let ex = dc.x - ux * hit;
+      let ey = dc.y - uy * hit;
+      if (dist - out - hit < 8) {
+        // Tokens are touching: a very short shot from center to center
+        sx = sc.x;
+        sy = sc.y;
+        ex = dc.x;
+        ey = dc.y;
+      }
+      const flight = Math.hypot(ex - sx, ey - sy);
+      const ms = Math.round(clamp(flight / 1.6, 160, 500)); // fast: about 1600 px per second
+      io.to(rooms).emit("projectile", {
+        id: randomUUID(), ammo, sx, sy, ex, ey,
+        angle: (Math.atan2(dc.y - sc.y, dc.x - sc.x) * 180) / Math.PI, // direction in degrees, 0 = right
+        ms,
+      });
+      io.to(rooms).emit("hit", { id: dst.id, delay: ms }); // the target shakes when the shot lands
+    } else {
+      // Melee Attack: straight line until the edges touch
+      let goal = dc;
+      if (MELEE_STOP_AT_CONTACT) {
+        const contact = (sSize + dSize) / 2;
+        goal = dist <= contact
+          ? sc // already touching: stay
+          : { x: dc.x - ((dc.x - sc.x) / dist) * contact, y: dc.y - ((dc.y - sc.y) / dist) * contact };
+      }
+      const x = clamp(goal.x - sSize / 2, 0, camp.map.w - sSize);
+      const y = clamp(goal.y - sSize / 2, 0, camp.map.h - sSize);
+      const moved = Math.hypot(x - src.x, y - src.y);
+      const ms = Math.round(clamp(350 + moved * 1.2, 400, 1500));
+      src.x = x;
+      src.y = y;
+      save();
+      if (moved >= 1) io.to(rooms).emit("tween", { id: src.id, x, y, ms });
+      io.to(rooms).emit("hit", { id: dst.id, delay: moved >= 1 ? ms : 0 }); // the target shakes when the attacker arrives
+    }
+
     postMsg(camp, acc, {
       to: secret ? [camp.gmId] : null,
       kind: "action",
       text: `${src.label} use ${label} to ${dst.label}`,
     });
   });
-
+    // GM: clear the chat for everyone
+  socket.on("clearChat", () => {
+    if (!isGm) return;
+    camp.messages = [];
+    save();
+    io.to(everyone(camp)).emit("chatCleared");
+    postMsg(camp, acc, { to: null, kind: "action", text: "The GM cleared the chat" });
+  });
   // Chat and dice
   socket.on("chat", (p: { text?: string; to?: string[] | null }) => {
     if (!allow(socket, "chat", 20, 10_000)) return;
