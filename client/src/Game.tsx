@@ -7,8 +7,8 @@ import { prepareMap, prepareThumb, prepareToken, upload } from "./imageUtils";
 import { signOut, socket } from "./socket";
 import { row } from "./styles";
 import type {
-  Init, InitiativeState, Invite, MapInfo, MapSummary, MapsPayload, Measure, Member, Msg, Roll, SavedToken,
-  Tier, TierInfo, Token,
+  Drawing, Init, InitiativeState, Invite, MapInfo, MapSummary, MapsPayload, Measure, Member, Msg, Roll,
+  SavedToken, Tier, TierInfo, Token,
 } from "./types";
 
 
@@ -28,12 +28,15 @@ type Tab = "token" | "chat" | "initiative" | "tokens" | "library" | "invite" | "
 type Tool = "none" | "line" | "circle" | "range";
 // A measurement on the map, in map pixels. A range ruler is centered on a token (it follows it) or on a point.
 type Ruler = { kind: "line" | "circle" | "range"; ax: number; ay: number; bx: number; by: number; tokenId?: string };
+type PingEvent = { id: string; x: number; y: number; name: string; gm: boolean };
 type Gesture =
-  | { kind: "pan"; sx: number; sy: number; vx: number; vy: number; moved: boolean; tap?: string }
+  | { kind: "pan"; sx: number; sy: number; vx: number; vy: number; moved: boolean; tap?: string; poly?: boolean; pinged?: boolean }
+  | { kind: "drawing"; id: string; sx: number; sy: number; ox: number; oy: number; orig: [number, number][]; moved: boolean }
   | { kind: "token"; id: string; dx: number; dy: number; sx: number; sy: number; moved: boolean }
   | { kind: "pinch"; dist: number; z: number; mapX: number; mapY: number }
   | { kind: "measure"; tool: "line" | "circle" }
   | null;
+type PanGesture = Extract<NonNullable<Gesture>, { kind: "pan" }>;
 
 const CELL = 40;
 const MIN_ZOOM = 0.1;
@@ -49,6 +52,8 @@ const NAMES_KEY = "vtt:names";
 const SIZES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 const D3_SIDES = [4, 6, 8, 10, 12, 20];
 const MAX_3D_DICE = 10;
+const PING_HOLD_MS = 3000; // hold this long to ping
+const PING_CHARGE_AFTER_MS = 600; // the growing ring shows up after this long
 // The three ruler buttons on the map. If your circle picture is named cicle-ruler.webp, change its path here.
 const RULER_BUTTONS = [
   { id: "line", label: "Line ruler", src: "/assets/ruler.webp" },
@@ -282,9 +287,21 @@ export default function Game({ init }: { init: Init }) {
   const [measure, setMeasure] = useState<Measure>(init.measure);
   const [measureDraft, setMeasureDraft] = useState<Partial<Record<keyof Measure, string>>>({});
   const [measureNote, setMeasureNote] = useState("");
-    const [diceOpen, setDiceOpen] = useState(false); // the floating dice pad
+  const [diceOpen, setDiceOpen] = useState(false); // the floating dice pad
+    // Polygon drawings
+  const [drawings, setDrawings] = useState<Drawing[]>(init.drawings);
+  const [polyMode, setPolyMode] = useState(false); // GM: drawing a polygon
+  const [polyPoints, setPolyPoints] = useState<[number, number][]>([]);
+  const [polyStroke, setPolyStroke] = useState("#c0392b");
+  const [polyFill, setPolyFill] = useState("#e74c3c");
+  const [polyNoStroke, setPolyNoStroke] = useState(false); // transparent border
+  const [polyNoFill, setPolyNoFill] = useState(false); // transparent fill (never both)
+  const [selectedDrawing, setSelectedDrawing] = useState<string | null>(null);
+    // Cursor pings
+  const [pings, setPings] = useState<PingEvent[]>([]);
+  const [charge, setCharge] = useState<{ x: number; y: number } | null>(null); // the growing ring while holding
 
-    const [newSave, setNewSave] = useState(true); // also save new tokens to the library
+  const [newSave, setNewSave] = useState(true); // also save new tokens to the library
   const [thumbTick, setThumbTick] = useState(0);
   const thumbsTried = useRef(new Set<string>());
   const thumbBusy = useRef(false);
@@ -308,6 +325,10 @@ export default function Game({ init }: { init: Init }) {
   const gesture = useRef<Gesture>(null);
   const dragPos = useRef<Pt | null>(null);
   const lastEmit = useRef(0);
+  const dragPoly = useRef<[number, number][] | null>(null); // where a dragged drawing is now
+  const pingTimer = useRef<number | undefined>(undefined);
+  const chargeTimer = useRef<number | undefined>(undefined);
+  const panToRef = useRef<(x: number, y: number) => void>(() => {});
   const lastTap = useRef<{ id: string; t: number } | null>(null); // for double-click detection on tokens
   const chatVisible = useRef(false);
   const toastTimer = useRef<number | undefined>(undefined);
@@ -526,6 +547,25 @@ export default function Game({ init }: { init: Init }) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [rulerActive]);
+
+    // Esc: leave polygon drawing and deselect a drawing
+  const polyActive = polyMode || selectedDrawing !== null;
+  useEffect(() => {
+    if (!polyActive) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setPolyMode(false);
+        setPolyPoints([]);
+        setSelectedDrawing(null);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [polyActive]);
+
+  useEffect(() => {
+    panToRef.current = panTo;
+  });  
   // ---------- live events ----------
   useEffect(() => {
     socket.on("members", setMembers);
@@ -610,21 +650,38 @@ export default function Game({ init }: { init: Init }) {
       setRollPopup(null);
     });
     // The GM opened another map: everyone gets its picture and tokens
-    socket.on("scene", ({ map: m, tokens: t }: { map: MapInfo; tokens: Record<string, Token> }) => {
-      dims.current = { w: m.w, h: m.h };
-      lastImage.current = m.image;
-      setMap(m);
-      setTokens(t);
-      setSelectedId(null);
-      setAction(null);
-      setPicker(null);
-      setShots([]);
-      setShaking({});
-      setTweens({});
-      setRuler(null);
-      fitMap();
+        socket.on(
+      "scene",
+      ({ map: m, tokens: t, drawings: dr }: { map: MapInfo; tokens: Record<string, Token>; drawings?: Drawing[] }) => {
+        dims.current = { w: m.w, h: m.h };
+        lastImage.current = m.image;
+        setMap(m);
+        setTokens(t);
+        setDrawings(dr ?? []);
+        setSelectedId(null);
+        setSelectedDrawing(null);
+        setPolyPoints([]);
+        setAction(null);
+        setPicker(null);
+        setShots([]);
+        setShaking({});
+        setTweens({});
+        setRuler(null);
+        fitMap();
+      }
+    );
+    socket.on("drawingAdded", (d: Drawing) => setDrawings((all) => [...all, d]));
+    socket.on("drawingRemoved", (id: string) => setDrawings((all) => all.filter((d) => d.id !== id)));
+    socket.on("drawingMoved", ({ id, points }: { id: string; points: [number, number][] }) =>
+      setDrawings((all) => all.map((d) => (d.id === id ? { ...d, points } : d)))
+    );
+        // A ping: a ripple with the name. Only the GM's ping moves the players' screens.
+    socket.on("pinged", (p: PingEvent) => {
+      setPings((all) => [...all, p]);
+      window.setTimeout(() => setPings((all) => all.filter((x) => x.id !== p.id)), 2100);
+      if (p.gm && !isGm) panToRef.current(p.x, p.y);
     });
-    
+
     socket.on("chat", (m: Msg) => {
       // Messages are handled one at a time so dice animations do not overlap
       queue.current = queue.current.then(async () => {
@@ -679,9 +736,13 @@ export default function Game({ init }: { init: Init }) {
       socket.off("measure");
       socket.off("chatCleared");
       socket.off("scene");
+      socket.off("drawingAdded");
+      socket.off("drawingRemoved");
+      socket.off("drawingMoved");
+            socket.off("pinged");
       socket.off("chat");
     };
-  }, [applyView, fitMap, me.id]);
+  }, [applyView, fitMap, me.id, isGm]);
 
   // ---------- pointer handling: tap, hover, drag token, pan, pinch ----------
   const canMove = (t: Token) => isGm || t.ownerId === me.id;
@@ -716,6 +777,77 @@ export default function Game({ init }: { init: Init }) {
     const el = document.elementFromPoint(cx, cy)?.closest("[data-token-id]") as HTMLElement | null;
     return el ? tokens[el.dataset.tokenId ?? ""] : undefined;
   };
+
+    // ---------- polygon drawing (GM) ----------
+  const finishPolygon = () => {
+    if (polyPoints.length < 3) return;
+    socket.emit("drawingAdd", {
+      points: polyPoints,
+      stroke: polyNoStroke ? null : polyStroke,
+      fill: polyNoFill ? null : polyFill,
+    });
+    setPolyPoints([]); // drawing mode stays on for the next shape
+  };
+
+  // A tap adds a corner (snapped to the grid corners if "Snap to grid" is on). Tapping the first corner closes the shape.
+  const addPolyPoint = (m: Pt) => {
+    const d = dims.current;
+    const x = clamp(snap ? Math.round(m.x / CELL) * CELL : m.x, 0, d.w);
+    const y = clamp(snap ? Math.round(m.y / CELL) * CELL : m.y, 0, d.h);
+    if (polyPoints.length >= 3) {
+      const [fx, fy] = polyPoints[0];
+      if (Math.hypot(fx - x, fy - y) * view.current.z < 14) {
+        finishPolygon();
+        return;
+      }
+    }
+    if (polyPoints.length >= 60) return;
+    setPolyPoints([...polyPoints, [x, y]]);
+  };
+
+    // ---------- cursor ping ----------
+  const clearPingTimers = () => {
+    window.clearTimeout(pingTimer.current);
+    window.clearTimeout(chargeTimer.current);
+    setCharge((c) => (c ? null : c));
+  };
+
+  // Called when a press on the map starts. Holding still for 3 seconds sends a ping.
+  const startPingTimers = (g: PanGesture) => {
+    clearPingTimers();
+    chargeTimer.current = window.setTimeout(() => {
+      if (gesture.current === g && !g.moved) setCharge(toMap({ x: g.sx, y: g.sy }));
+    }, PING_CHARGE_AFTER_MS);
+    pingTimer.current = window.setTimeout(() => {
+      if (gesture.current !== g || g.moved) return; // the finger moved, was lifted, or a pinch started
+      g.pinged = true; // the release at the end is not a tap
+      setCharge(null);
+      const m = toMap({ x: g.sx, y: g.sy });
+      socket.emit("ping", { x: m.x, y: m.y });
+    }, PING_HOLD_MS);
+  };
+
+  // Glide the view so that a map point is in the middle of what the player can see
+  const panTo = (mx: number, my: number) => {
+    const { w, h } = vpSize();
+    let sx = w / 2;
+    let sy = h / 2;
+    if (open) {
+      if (narrow) sy = (h * 0.42) / 2;
+      else sx = Math.max(100, (w - (PANEL_W + 12)) / 2);
+    }
+    const from = view.current;
+    const to = { x: sx - mx * from.z, y: sy - my * from.z };
+    const t0 = performance.now();
+    const step = (now: number) => {
+      const k = Math.min(1, (now - t0) / 350);
+      const e = 1 - Math.pow(1 - k, 3);
+      applyView({ x: from.x + (to.x - from.x) * e, y: from.y + (to.y - from.y) * e, z: from.z });
+      if (k < 1) requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  };
+
   const startPinch = () => {
     const [a, b] = [...pointers.current.values()];
     const v = view.current;
@@ -770,11 +902,17 @@ export default function Game({ init }: { init: Init }) {
     pointers.current.set(e.pointerId, p);
 
     if (pointers.current.size === 2) {
+      clearPingTimers();
       finishToken();
       startPinch();
       return;
     }
-        // A ruler tool is on: dragging draws a measurement (hold Shift to pan or move tokens as usual)
+    // Polygon drawing: a tap adds a corner, a drag pans the map as usual
+    if (polyMode && isGm) {
+      gesture.current = { kind: "pan", sx: p.x, sy: p.y, vx: view.current.x, vy: view.current.y, moved: false, poly: true };
+      return;
+    }
+    // A ruler tool is on: dragging draws a measurement (hold Shift to pan or move tokens as usual)
     if (tool !== "none" && !e.shiftKey) {
       const t = tokenAtPoint(e.clientX, e.clientY);
       const spot = snapPoint(toMap(p));
@@ -802,9 +940,23 @@ export default function Game({ init }: { init: Init }) {
       dragPos.current = null;
       gesture.current = { kind: "token", id: t.id, dx: m.x - t.x, dy: m.y - t.y, sx: p.x, sy: p.y, moved: false };
     } else {
-      gesture.current = {
+      // The GM can press a drawing: a tap selects it, a drag moves it
+      const dEl = isGm ? (e.target as Element).closest("[data-drawing-id]") : null;
+      const dr = dEl ? drawings.find((x) => x.id === dEl.getAttribute("data-drawing-id")) : undefined;
+      if (dr) {
+        const m0 = toMap(p);
+        gesture.current = { kind: "drawing", id: dr.id, sx: p.x, sy: p.y, ox: m0.x, oy: m0.y, orig: dr.points, moved: false };
+        dragPoly.current = null;
+        setSelectedDrawing(dr.id);
+        setSelectedId(null);
+        setAction(null);
+        return;
+      }
+      const panGesture: PanGesture = {
         kind: "pan", sx: p.x, sy: p.y, vx: view.current.x, vy: view.current.y, moved: false, tap: t?.id,
       };
+      gesture.current = panGesture;
+      startPingTimers(panGesture); // holding still for 3 seconds pings
     }
   };
 
@@ -835,6 +987,33 @@ export default function Game({ init }: { init: Init }) {
       setRuler((r) => (r && r.kind === g.tool ? { ...r, bx: b.x, by: b.y } : r));
       return;
     }
+        if (g.kind === "drawing") {
+      if (!g.moved && Math.hypot(p.x - g.sx, p.y - g.sy) > TAP_SLOP) g.moved = true;
+    if (g.moved) clearPingTimers();
+      if (!g.moved) return;
+      const m = toMap(p);
+      let dx = m.x - g.ox;
+      let dy = m.y - g.oy;
+      if (snap) {
+        dx = Math.round(dx / CELL) * CELL; // moves in whole squares
+        dy = Math.round(dy / CELL) * CELL;
+      }
+      // keep the whole shape inside the map
+      const d = dims.current;
+      const xs = g.orig.map((q) => q[0]);
+      const ys = g.orig.map((q) => q[1]);
+      dx = clamp(dx, -Math.min(...xs), d.w - Math.max(...xs));
+      dy = clamp(dy, -Math.min(...ys), d.h - Math.max(...ys));
+      const pts = g.orig.map((q) => [Math.round((q[0] + dx) * 10) / 10, Math.round((q[1] + dy) * 10) / 10] as [number, number]);
+      dragPoly.current = pts;
+      setDrawings((all) => all.map((x) => (x.id === g.id ? { ...x, points: pts } : x)));
+      const now = Date.now();
+      if (now - lastEmit.current > 60) {
+        lastEmit.current = now;
+        socket.emit("drawingMove", { id: g.id, points: pts });
+      }
+      return;
+    }
     if (!g.moved && Math.hypot(p.x - g.sx, p.y - g.sy) > TAP_SLOP) g.moved = true;
     if (!g.moved) return;
 
@@ -858,22 +1037,31 @@ export default function Game({ init }: { init: Init }) {
   const onUp = (e: PointerEvent<HTMLDivElement>) => {
     if (!pointers.current.has(e.pointerId)) return;
     pointers.current.delete(e.pointerId);
+    clearPingTimers();
     const g = gesture.current;
     if (g?.kind === "token") {
       finishToken();
+    } else if (g?.kind === "drawing") {
+      // Dropped a moved drawing: send its final place
+      if (g.moved && dragPoly.current) socket.emit("drawingMove", { id: g.id, points: dragPoly.current });
+      dragPoly.current = null;
     } else if (g?.kind === "pinch" && pointers.current.size === 1) {
       // One finger left after a pinch: carry on as a pan without jumping
       const [p] = [...pointers.current.values()];
       gesture.current = { kind: "pan", sx: p.x, sy: p.y, vx: view.current.x, vy: view.current.y, moved: true };
-    } else if (g?.kind === "pan" && !g.moved) {
-      if (g.tap) {
+    } else if (g?.kind === "pan" && !g.moved && !g.pinged) {
+      if (g.poly) {
+        addPolyPoint(toMap({ x: g.sx, y: g.sy })); // polygon drawing: a tap adds a corner
+      } else if (g.tap) {
         setSelectedId(g.tap); // tap on a token you cannot move: show its name
       } else {
         setSelectedId(null); // tap on empty map
         setAction(null);
+        setSelectedDrawing(null);
         if (!isGm) setOpen(false); // players: also closes the panel
       }
     }
+    
     if (pointers.current.size === 0) gesture.current = null;
   };
 
@@ -1310,6 +1498,21 @@ export default function Game({ init }: { init: Init }) {
           75% { transform: translate(-3%, 0); }
           90% { transform: translate(3%, 0); }
         }
+                @keyframes vttRipple {
+          0% { transform: translate(-50%, -50%) scale(0.1); opacity: 0; }
+          10% { opacity: 0.95; }
+          100% { transform: translate(-50%, -50%) scale(1); opacity: 0; }
+        }
+        @keyframes vttPingLabel {
+          0% { opacity: 0; transform: translate(-50%, -50%) scale(0.6); }
+          12% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+          80% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+          100% { opacity: 0; transform: translate(-50%, -50%) scale(1); }
+        }
+        @keyframes vttCharge {
+          0% { transform: translate(-50%, -50%) scale(0.25); opacity: 0.25; }
+          100% { transform: translate(-50%, -50%) scale(1); opacity: 0.95; }
+        }
         @media (prefers-reduced-motion: reduce) {
           [data-token-id] { animation: none !important; }
         }
@@ -1325,8 +1528,8 @@ export default function Game({ init }: { init: Init }) {
         onContextMenu={(e) => e.preventDefault()}
         style={{
           position: "absolute", inset: 0, overflow: "hidden", background: "#3a3a3a",
-          touchAction: "none", userSelect: "none", cursor: tool !== "none" ? "show" : "grab",
-        }}
+                    touchAction: "none", userSelect: "none", cursor: tool !== "none" || polyMode ? "crosshair" : "grab",
+          }}
       >
         <div
           ref={layerRef}
@@ -1343,6 +1546,37 @@ export default function Game({ init }: { init: Init }) {
                 backgroundImage: gridImage, backgroundSize: `${CELL}px ${CELL}px`,
               }}
             />
+          )}
+          {/* polygons drawn by the GM: solid, and above the tokens */}
+          {drawings.length > 0 && (
+            <svg
+              width={map.w} height={map.h}
+              style={{ position: "absolute", left: 0, top: 0, overflow: "visible", pointerEvents: "none", zIndex: 90000 }}
+            >
+              {drawings.map((d) => {
+                const pts = d.points.map((q) => `${q[0]},${q[1]}`).join(" ");
+                return (
+                  <g key={d.id}>
+                    {d.id === selectedDrawing && (
+                      <polygon
+                        points={pts} fill="none" stroke="#f1c40f" strokeLinejoin="round" strokeOpacity={0.9}
+                        style={{ strokeWidth: sc(8) }}
+                      />
+                    )}
+                    <polygon
+                      points={pts} fill={d.fill ?? "none"} stroke={d.stroke ?? "none"}
+                      strokeLinejoin="round" style={{ strokeWidth: sc(3) }}
+                    />
+                    {isGm && (
+                      <polygon
+                        data-drawing-id={d.id} points={pts} fill={d.fill ? "transparent" : "none"} stroke="transparent"
+                        style={{ strokeWidth: sc(16), pointerEvents: d.fill ? "all" : "stroke", cursor: "move" }}
+                      />
+                    )}
+                  </g>
+                );
+              })}
+            </svg>
           )}
 
           {/* token pictures, drawn in layer order */}
@@ -1444,12 +1678,91 @@ export default function Game({ init }: { init: Init }) {
               {rulerSvg}
             </svg>
           )}
+          {/* the polygon being drawn */}
+          {isGm && polyMode && polyPoints.length > 0 && (
+            <svg
+              width={map.w} height={map.h}
+              style={{ position: "absolute", left: 0, top: 0, overflow: "visible", pointerEvents: "none", zIndex: 99996 }}
+            >
+              {polyPoints.length >= 3 && (
+                <polygon
+                  points={polyPoints.map((q) => `${q[0]},${q[1]}`).join(" ")}
+                  fill={polyNoFill ? "none" : polyFill} fillOpacity={0.3} stroke="none"
+                />
+              )}
+              <polyline
+                points={polyPoints.map((q) => `${q[0]},${q[1]}`).join(" ")} fill="none"
+                stroke={polyNoStroke ? "#7f8c8d" : polyStroke} strokeLinejoin="round" strokeLinecap="round"
+                style={{ strokeWidth: sc(3) }}
+              />
+              {polyPoints.length >= 3 && (
+                <line
+                  x1={polyPoints[polyPoints.length - 1][0]} y1={polyPoints[polyPoints.length - 1][1]}
+                  x2={polyPoints[0][0]} y2={polyPoints[0][1]}
+                  stroke="#7f8c8d" strokeLinecap="round" style={{ strokeWidth: sc(2) }}
+                />
+              )}
+              {/* the first corner is bigger: tap it to close the shape */}
+              <line
+                x1={polyPoints[0][0]} y1={polyPoints[0][1]} x2={polyPoints[0][0] + 0.01} y2={polyPoints[0][1]}
+                stroke="#fff" strokeLinecap="round" style={{ strokeWidth: sc(20) }}
+              />
+              {polyPoints.map((q, i) => (
+                <g key={i}>{dot(q[0], q[1], i === 0 ? "#27ae60" : "#2c3e50")}</g>
+              ))}
+            </svg>
+          )}
+                    {/* the growing ring while you hold for a ping */}
+          {charge && (
+            <div
+              style={{
+                position: "absolute", left: charge.x, top: charge.y, zIndex: 99998, pointerEvents: "none",
+                width: "calc(64px * var(--inv, 1))", height: "calc(64px * var(--inv, 1))",
+                borderRadius: "50%", boxSizing: "border-box", border: "calc(3px * var(--inv, 1)) solid #f1c40f",
+                animation: `vttCharge ${(PING_HOLD_MS - PING_CHARGE_AFTER_MS) / 1000}s linear both`,
+              }}
+            />
+          )}
+
+          {/* pings: a ripple for 2 seconds with the name in the middle */}
+          {pings.map((pg) => {
+            const color = pg.gm ? "#f1c40f" : "#2980b9";
+            return (
+              <div
+                key={pg.id}
+                style={{ position: "absolute", left: pg.x, top: pg.y, width: 0, height: 0, zIndex: 99998, pointerEvents: "none" }}
+              >
+                {[0, 0.3, 0.6].map((delay) => (
+                  <div
+                    key={delay}
+                    style={{
+                      position: "absolute", left: 0, top: 0, boxSizing: "border-box", borderRadius: "50%",
+                      width: "calc(190px * var(--inv, 1))", height: "calc(190px * var(--inv, 1))",
+                      border: `calc(4px * var(--inv, 1)) solid ${color}`, background: `${color}22`,
+                      animation: `vttRipple 1.4s ease-out ${delay}s both`,
+                    }}
+                  />
+                ))}
+                <div
+                  style={{
+                    position: "absolute", left: 0, top: 0, whiteSpace: "nowrap", borderRadius: 14,
+                    padding: "calc(3px * var(--inv, 1)) calc(10px * var(--inv, 1))", background: color,
+                    color: pg.gm ? "#222" : "#fff", fontSize: "calc(14px * var(--inv, 1))", fontWeight: 700,
+                    boxShadow: "0 1px 4px #0006", animation: "vttPingLabel 2s ease-out both",
+                  }}
+                >
+                  {pg.name}
+                </div>
+              </div>
+            );
+          })}  
         </div>
         {/* 3D dice are drawn over the visible area, not the whole map; clicks pass through */}
         <div id="dice-layer" style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 50 }} />
+          
       </div>
 
-                 {/* ---------- ruler buttons and dice button ---------- */}
+      {/* ---------- ruler buttons and dice button ---------- */}
       <div style={{ position: "absolute", top: 62, left: 12, zIndex: 95, display: "flex", flexDirection: "column", gap: 8 }}>
         {RULER_BUTTONS.map((b) => {
           const on = tool === b.id;
@@ -1460,6 +1773,8 @@ export default function Game({ init }: { init: Init }) {
               aria-label={b.label}
               onClick={() => {
                 setMenuOpen(false);
+                setPolyMode(false);
+                setPolyPoints([]);
                 setTool((cur) => (cur === b.id ? "none" : b.id));
               }}
               style={{
@@ -1493,7 +1808,71 @@ export default function Game({ init }: { init: Init }) {
             style={{ mixBlendMode: "multiply", pointerEvents: "none" }}
           />
         </button>
+        {isGm && (
+          <button
+            title="Draw a polygon"
+            aria-label="Draw a polygon"
+            onClick={() => {
+              setMenuOpen(false);
+              setTool("none");
+              setRuler(null);
+              setSelectedDrawing(null);
+              setPolyPoints([]);
+              setPolyMode((v) => !v);
+            }}
+            style={{
+              ...floating, width: 40, height: 40, borderRadius: "50%", padding: 0, cursor: "pointer",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              border: polyMode ? "3px solid #f1c40f" : "1px solid #bbb", background: polyMode ? "#fff6cc" : "#fff",
+            }}
+          >
+            <img
+              src="/assets/polygon.svg" alt="" width={22} height={22} draggable={false}
+              style={{ mixBlendMode: "multiply", pointerEvents: "none" }}
+            />
+          </button>
+        )}
+      
+
+      {/* ---------- a drawing is selected (GM) ---------- */}
+      {isGm && !polyMode && selectedDrawing && drawings.some((d) => d.id === selectedDrawing) && (
+        <div
+          style={{
+            ...floating, position: "absolute", top: 12, left: 62, zIndex: 100, padding: "8px 10px", fontSize: 13,
+            display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap",
+          }}
+        >
+          <span>Drawing selected</span>
+          <button
+            onClick={() => {
+              socket.emit("drawingDelete", { id: selectedDrawing });
+              setSelectedDrawing(null);
+            }}
+            style={{ color: "#c0392b" }}
+          >
+            Delete drawing
+          </button>
+          <button onClick={() => setSelectedDrawing(null)}>Close</button>
+        </div>
+      )}
       </div>
+      
+      {/* ---------- ruler tool bar: on while a tool is on or a drawing is on the map ---------- */}
+      
+      {/* ---------- ruler tool bar: on while a tool is on or a drawing is on the map ---------- */}
+      {(tool !== "none" || ruler) && (
+        <div
+          style={{
+            ...floating, position: "absolute", top: 12, left: 62, zIndex: 100, padding: "8px 10px", fontSize: 13,
+            maxWidth: `calc(100% - ${open && !narrow ? PANEL_W + 100 : 74}px)`,
+            display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap",
+          }}
+        >
+          <span>{tool !== "none" ? TOOL_HELP[tool] : "A measurement is on the map."}</span>
+          <button onClick={() => setTool("none")} disabled={tool === "none"}>Stop</button>
+          <button onClick={() => setRuler(null)} disabled={!ruler}>Clear</button>
+        </div>
+      )}
 
       {/* ---------- the dice pad (opens from the dice button) ---------- */}
       {diceOpen && (
@@ -1521,20 +1900,51 @@ export default function Game({ init }: { init: Init }) {
         </div>
       )}
 
-      {/* ---------- ruler tool bar: on while a tool is on or a drawing is on the map ---------- */}
-      {(tool !== "none" || ruler) && (
+      {/* ---------- polygon drawing bar (GM) ---------- */}
+      {isGm && polyMode && (
         <div
           style={{
             ...floating, position: "absolute", top: 12, left: 62, zIndex: 100, padding: "8px 10px", fontSize: 13,
             maxWidth: `calc(100% - ${open && !narrow ? PANEL_W + 100 : 74}px)`,
-            display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap",
+            display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap",
           }}
         >
-          <span>{tool !== "none" ? TOOL_HELP[tool] : "A measurement is on the map."}</span>
-          <button onClick={() => setTool("none")} disabled={tool === "none"}>Stop</button>
-          <button onClick={() => setRuler(null)} disabled={!ruler}>Clear</button>
+          <span>Tap the map to add corners. Tap the first corner to close. Drag to pan.</span>
+          <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            Border
+            <input type="color" value={polyStroke} disabled={polyNoStroke} onChange={(e) => setPolyStroke(e.target.value)} />
+            <input
+              type="checkbox" checked={polyNoStroke} disabled={polyNoFill}
+              onChange={(e) => setPolyNoStroke(e.target.checked)}
+            />
+            transparent
+          </label>
+          <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            Fill
+            <input type="color" value={polyFill} disabled={polyNoFill} onChange={(e) => setPolyFill(e.target.value)} />
+            <input
+              type="checkbox" checked={polyNoFill} disabled={polyNoStroke}
+              onChange={(e) => setPolyNoFill(e.target.checked)}
+            />
+            transparent
+          </label>
+          <button disabled={polyPoints.length < 3} onClick={finishPolygon}>Finish</button>
+          <button disabled={polyPoints.length === 0} onClick={() => setPolyPoints((pts) => pts.slice(0, -1))}>
+            Undo point
+          </button>
+          <button disabled={polyPoints.length === 0} onClick={() => setPolyPoints([])}>Cancel shape</button>
+          <button
+            onClick={() => {
+              setPolyMode(false);
+              setPolyPoints([]);
+            }}
+          >
+            Done
+          </button>
         </div>
       )}
+
+      
       {/* ---------- menu button and menu ---------- */}
       <button
         onClick={() => setMenuOpen((v) => !v)}
@@ -1611,7 +2021,7 @@ export default function Game({ init }: { init: Init }) {
           )}
         </div>
       )}
-            {/* ---------- players: roll initiative ---------- */}
+      {/* ---------- players: roll initiative ---------- */}
       {showInitPopup && (
         <div
           style={{

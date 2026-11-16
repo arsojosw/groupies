@@ -40,6 +40,9 @@ export type Asset = { file: string; size: number };
 export type InitEntry = { tokenId: string; value: number | null };
 export type Initiative = { active: boolean; startedAt: number; entries: InitEntry[] };
 
+// A polygon drawn on a map. A border or fill of null means transparent (never both).
+export type Drawing = { id: string; points: [number, number][]; stroke: string | null; fill: string | null };
+
 // One map with its own tokens
 export type SceneMap = {
   id: string; name: string; image?: string; thumb?: string; w: number; h: number;
@@ -65,7 +68,7 @@ export type Campaign = {
     maps: Record<string, SceneMap>; activeMapId: string; library: SavedToken[];
   initiativeDie?: number; // dice for initiative: 6, 10 or 20
   measure?: Measure; // ruler settings
-  
+  drawings?: Drawing[]; // polygons drawn on this map
   readonly map: SceneMap;
   readonly tokens: Record<string, Token>;
 };

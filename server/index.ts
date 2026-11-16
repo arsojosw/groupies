@@ -10,7 +10,7 @@ import {
   createGm, checkLogin, createPlayer, ensureAdmin, activeInvites, listInvites, findInvite,
   setPassword, purgeOrphanSessions, logEvent, tierSetting, TIERS, DEFAULT_MEASURE,
 } from "./store";
-import type { Account, Campaign, Measure, Msg, Role, SceneMap, Tier, Token } from "./store";
+import type { Account, Campaign, Drawing, Measure, Msg, Role, SceneMap, Tier, Token } from "./store";
 
 const app = express();
 const httpServer = createServer(app);
@@ -19,6 +19,8 @@ const io = new Server(httpServer, { cors: { origin: "*" } });
 const CELL = 40;
 const MAX_TOKENS = 50; // tokens on one map
 const MAX_LIBRARY = 200; // saved tokens
+const MAX_DRAWINGS = 100; // polygons on one map
+const MAX_POINTS = 60; // corners in one polygon
 const MIN_MAP = 400;
 const MAX_MAP = 4000;
 const MAX_MAP_BYTES = 6 * 1024 * 1024;
@@ -254,14 +256,17 @@ function sendMaps(camp: Campaign) {
   io.to(gmRoom(camp)).emit("maps", { activeMapId: camp.activeMapId, maps: mapList(camp), tier: tierInfo(camp) });
 }
 
-// Everyone gets the open map and its tokens (players without hidden tokens)
+// Everyone gets the open map, its tokens (players without hidden tokens) and its drawings
 function broadcastScene(camp: Campaign) {
-  io.to(gmRoom(camp)).emit("scene", { map: mapInfo(camp), tokens: tokensFor(camp, "gm") });
-  io.to(playerRoom(camp)).emit("scene", { map: mapInfo(camp), tokens: tokensFor(camp, "player") });
+  io.to(gmRoom(camp)).emit("scene", { map: mapInfo(camp), tokens: tokensFor(camp, "gm"), drawings: drawingsOf(camp) });
+  io.to(playerRoom(camp)).emit("scene", { map: mapInfo(camp), tokens: tokensFor(camp, "player"), drawings: drawingsOf(camp) });
   sendInitiative(camp);
 }
 
 const measureOf = (camp: Campaign): Measure => ({ ...DEFAULT_MEASURE, ...camp.measure });
+// The polygons of the open map
+const drawingsOf = (camp: Campaign) => (camp.map.drawings ??= []);
+
 // ---------- initiative ----------
 const initDie = (camp: Campaign) => (camp.initiativeDie === 6 || camp.initiativeDie === 10 ? camp.initiativeDie : 20);
 
@@ -296,6 +301,7 @@ function sendInit(socket: Socket, acc: Account, camp: Campaign) {
     invites: acc.role === "gm" ? listInvites(camp) : undefined,
     initiative: initiativeFor(camp, acc.role),
     measure: measureOf(camp),
+    drawings: drawingsOf(camp),
     ...(acc.role === "gm"
       ? { library: camp.library, maps: mapList(camp), activeMapId: camp.activeMapId, tier: tierInfo(camp) }
       : {}),
@@ -1197,7 +1203,58 @@ io.on("connection", (socket) => {
     });
     sendInitiative(camp);
   });
+  // GM: draw a polygon on the open map
+  socket.on("drawingAdd", (p: { points?: unknown; stroke?: unknown; fill?: unknown }) => {
+    if (!isGm || !p || !Array.isArray(p.points)) return;
+    const list = drawingsOf(camp);
+    if (list.length >= MAX_DRAWINGS) return;
+    const pts: [number, number][] = [];
+    for (const raw of p.points.slice(0, MAX_POINTS)) {
+      if (!Array.isArray(raw)) return;
+      const x = Number(raw[0]);
+      const y = Number(raw[1]);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+      pts.push([Math.round(clamp(x, 0, camp.map.w) * 10) / 10, Math.round(clamp(y, 0, camp.map.h) * 10) / 10]);
+    }
+    if (pts.length < 3) return;
+    const color = (v: unknown) => (typeof v === "string" && /^#[0-9a-fA-F]{6}$/.test(v) ? v : null);
+    const stroke = color(p.stroke);
+    const fill = color(p.fill);
+    if (stroke === null && fill === null) return; // the border and the fill cannot both be transparent
+    const d: Drawing = { id: randomUUID(), points: pts, stroke, fill };
+    list.push(d);
+    save();
+    io.to(everyone(camp)).emit("drawingAdded", d);
+  });
 
+    // GM: move a polygon (the same shape in a new place)
+  socket.on("drawingMove", (p: { id?: string; points?: unknown }) => {
+    if (!isGm || typeof p?.id !== "string" || !Array.isArray(p.points)) return;
+    const d = drawingsOf(camp).find((x) => x.id === p.id);
+    if (!d || p.points.length !== d.points.length) return;
+    const pts: [number, number][] = [];
+    for (const raw of p.points) {
+      if (!Array.isArray(raw)) return;
+      const x = Number(raw[0]);
+      const y = Number(raw[1]);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+      pts.push([Math.round(clamp(x, 0, camp.map.w) * 10) / 10, Math.round(clamp(y, 0, camp.map.h) * 10) / 10]);
+    }
+    d.points = pts;
+    save();
+    socket.to(everyone(camp)).emit("drawingMoved", { id: d.id, points: pts });
+  });
+
+  // GM: delete a polygon
+  socket.on("drawingDelete", (p: { id?: string }) => {
+    if (!isGm || typeof p?.id !== "string") return;
+    const list = drawingsOf(camp);
+    const i = list.findIndex((d) => d.id === p.id);
+    if (i < 0) return;
+    list.splice(i, 1);
+    save();
+    io.to(everyone(camp)).emit("drawingRemoved", p.id);
+  });
   // GM: the dice used for initiative
   socket.on("setInitiativeDie", (die: number) => {
     if (!isGm || ![6, 10, 20].includes(die)) return;
@@ -1222,7 +1279,20 @@ io.on("connection", (socket) => {
     io.to(everyone(camp)).emit("measure", m);
     cb?.({ ok: true });
   });
-  
+    // Cursor ping: the browser sends it after a 3 second hold. Everyone sees a ripple with the name.
+  socket.on("ping", (p: { x?: number; y?: number }) => {
+    if (!allow(socket, "ping", 3, 10_000)) return;
+    const x = Number(p?.x);
+    const y = Number(p?.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    io.to(everyone(camp)).emit("pinged", {
+      id: randomUUID(),
+      x: clamp(x, 0, camp.map.w),
+      y: clamp(y, 0, camp.map.h),
+      name: acc.name,
+      gm: isGm,
+    });
+  });
   // GM: clear the chat for everyone
   socket.on("clearChat", () => {
     if (!isGm) return;

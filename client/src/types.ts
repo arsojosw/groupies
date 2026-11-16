@@ -31,10 +31,12 @@ export type Init = {
   tokens: Record<string, Token>; messages: Msg[]; invites?: Invite[];
     initiative: InitiativeState;
   measure: Measure;
+  drawings: Drawing[];
   // GM only
   library?: SavedToken[]; maps?: MapSummary[]; activeMapId?: string; tier?: TierInfo;
   
 };
+export type Drawing = { id: string; points: [number, number][]; stroke: string | null; fill: string | null };
 export type GmRow = {
   id: string; username: string; campaign: string; players: number; online: number;
   paid: boolean; paidUntil: number | null; tier: Tier; maps: number;
