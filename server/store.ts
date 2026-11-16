@@ -37,10 +37,14 @@ export type Invite = {
 };
 export type Asset = { file: string; size: number };
 
+export type InitEntry = { tokenId: string; value: number | null };
+export type Initiative = { active: boolean; startedAt: number; entries: InitEntry[] };
+
 // One map with its own tokens
 export type SceneMap = {
   id: string; name: string; image?: string; thumb?: string; w: number; h: number;
   tokens: Record<string, Token>; createdAt: number;
+  initiative?: Initiative; // the initiative tracker of this map
 };
 
 // A token kept in the GM's library. It can be placed on any map.
@@ -50,11 +54,18 @@ export type SavedToken = {
   fromTokenId?: string; // the map token this entry was made from and stays in step with
 };
 
+
+// Distances used by the rulers: feet per square, and the outer edge (in feet) of each range band
+export type Measure = { ftPerSquare: number; melee: number; veryClose: number; close: number; far: number };
+export const DEFAULT_MEASURE: Measure = { ftPerSquare: 5, melee: 5, veryClose: 15, close: 30, far: 60 };
+
 export type Campaign = {
   id: string; name: string; gmId: string; memberIds: string[];
   messages: Msg[]; invites: Invite[]; assets: Record<string, Asset>;
-  maps: Record<string, SceneMap>; activeMapId: string; library: SavedToken[];
-  // The open map and its tokens: always the active map. Set up by bindCampaign, never saved on their own.
+    maps: Record<string, SceneMap>; activeMapId: string; library: SavedToken[];
+  initiativeDie?: number; // dice for initiative: 6, 10 or 20
+  measure?: Measure; // ruler settings
+  
   readonly map: SceneMap;
   readonly tokens: Record<string, Token>;
 };
@@ -290,10 +301,12 @@ export function listInvites(camp: Campaign) {
   return camp.invites;
 }
 
-export function findInvite(code: unknown) {
+// A full link still lets players who already joined come back, so it can be looked up ignoring its uses
+export function findInvite(code: unknown, ignoreUses = false) {
   if (typeof code !== "string") return null;
+  const now = Date.now();
   for (const camp of Object.values(db.campaigns)) {
-    const inv = activeInvites(camp).find((i) => i.code === code);
+    const inv = camp.invites.find((i) => i.code === code && i.expiresAt > now && (ignoreUses || i.uses < i.maxUses));
     if (inv) return { camp, inv };
   }
   return null;

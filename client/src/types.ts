@@ -29,8 +29,11 @@ export type Invite = {
 export type Init = {
   me: Me; campaign: { name: string }; map: MapInfo; members: Member[];
   tokens: Record<string, Token>; messages: Msg[]; invites?: Invite[];
+    initiative: InitiativeState;
+  measure: Measure;
   // GM only
   library?: SavedToken[]; maps?: MapSummary[]; activeMapId?: string; tier?: TierInfo;
+  
 };
 export type GmRow = {
   id: string; username: string; campaign: string; players: number; online: number;
@@ -43,3 +46,6 @@ export type AdminInit = {
   settings: { tiers: Record<Tier, TierSetting> };
 };
 export type Locked = { role: Role; campaign: string };
+export type InitEntry = { tokenId: string; value: number | null };
+export type InitiativeState = { active: boolean; startedAt: number; die: number; entries: InitEntry[] };
+export type Measure = { ftPerSquare: number; melee: number; veryClose: number; close: number; far: number };

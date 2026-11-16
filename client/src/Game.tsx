@@ -7,7 +7,8 @@ import { prepareMap, prepareThumb, prepareToken, upload } from "./imageUtils";
 import { signOut, socket } from "./socket";
 import { row } from "./styles";
 import type {
-  Init, Invite, MapInfo, MapSummary, MapsPayload, Member, Msg, Roll, SavedToken, Tier, TierInfo, Token,
+  Init, InitiativeState, Invite, MapInfo, MapSummary, MapsPayload, Measure, Member, Msg, Roll, SavedToken,
+  Tier, TierInfo, Token,
 } from "./types";
 
 
@@ -23,11 +24,15 @@ type TokenPatch = {
 type View = { x: number; y: number; z: number }; // pan in screen px, zoom factor
 type Pt = { x: number; y: number };
 type Dims = { w: number; h: number };
-type Tab = "token" | "chat" | "dice" | "tokens" | "library" | "invite" | "settings";
+type Tab = "token" | "chat" | "initiative" | "tokens" | "library" | "invite" | "settings";
+type Tool = "none" | "line" | "circle" | "range";
+// A measurement on the map, in map pixels. A range ruler is centered on a token (it follows it) or on a point.
+type Ruler = { kind: "line" | "circle" | "range"; ax: number; ay: number; bx: number; by: number; tokenId?: string };
 type Gesture =
   | { kind: "pan"; sx: number; sy: number; vx: number; vy: number; moved: boolean; tap?: string }
   | { kind: "token"; id: string; dx: number; dy: number; sx: number; sy: number; moved: boolean }
   | { kind: "pinch"; dist: number; z: number; mapX: number; mapY: number }
+  | { kind: "measure"; tool: "line" | "circle" }
   | null;
 
 const CELL = 40;
@@ -44,6 +49,17 @@ const NAMES_KEY = "vtt:names";
 const SIZES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 const D3_SIDES = [4, 6, 8, 10, 12, 20];
 const MAX_3D_DICE = 10;
+// The three ruler buttons on the map. If your circle picture is named cicle-ruler.webp, change its path here.
+const RULER_BUTTONS = [
+  { id: "line", label: "Line ruler", src: "/assets/ruler.webp" },
+  { id: "circle", label: "Circle ruler", src: "/assets/circle-ruler.webp" },
+  { id: "range", label: "Distance ranges (Melee, Very close, Close, Far)", src: "/assets/far-ruler.webp" },
+] as const;
+const TOOL_HELP = {
+  line: "Line ruler: drag on the map. Start or end on a token to snap to it.",
+  circle: "Circle ruler: drag outward from the center. Start on a token to center on it.",
+  range: "Ranges: tap a token (or any spot) to show Melee, Very close, Close and Far.",
+} as const;
 const TIER_NAMES: Record<Tier, string> = { free: "Free", basic: "Basic", pro: "Pro", master: "Master" };
 const fmtMb = (bytes: number) => (bytes / 1024 / 1024).toFixed(1);
 const PANEL_W = 460; // width of the side panel on laptop screens
@@ -54,11 +70,11 @@ const floating: CSSProperties = {
 const TAB_ICONS: Record<Tab, { src: string; label: string }> = {
   token: { src: "/assets/user.webp", label: "My token" },
   chat: { src: "/assets/chat.webp", label: "Chat" },
-  dice: { src: "/assets/dice.webp", label: "Dice" },
   tokens: { src: "/assets/user.webp", label: "Tokens" },
   invite: { src: "/assets/invitelink.webp", label: "Invite players" },
   settings: { src: "/assets/gearsettings.webp", label: "Settings" },
-    library: { src: "/assets/library.svg", label: "Library" },
+  library: { src: "/assets/library.svg", label: "Library" },
+  initiative: { src: "/assets/sword.webp", label: "Initiative" },
 };
 
 // The action buttons shown for a selected token. What each one does comes later.
@@ -256,6 +272,18 @@ export default function Game({ init }: { init: Init }) {
   const [newMapName, setNewMapName] = useState("");
   const [libNote, setLibNote] = useState("");
   const libTimer = useRef<number | undefined>(undefined);
+    // Initiative tracker
+  const [initiative, setInitiative] = useState<InitiativeState>(init.initiative);
+  const [initDismissed, setInitDismissed] = useState(0); // start time of the roll popup the player closed
+  const [initAddId, setInitAddId] = useState("");
+    // Rulers
+  const [tool, setTool] = useState<Tool>("none");
+  const [ruler, setRuler] = useState<Ruler | null>(null);
+  const [measure, setMeasure] = useState<Measure>(init.measure);
+  const [measureDraft, setMeasureDraft] = useState<Partial<Record<keyof Measure, string>>>({});
+  const [measureNote, setMeasureNote] = useState("");
+    const [diceOpen, setDiceOpen] = useState(false); // the floating dice pad
+
     const [newSave, setNewSave] = useState(true); // also save new tokens to the library
   const [thumbTick, setThumbTick] = useState(0);
   const thumbsTried = useRef(new Set<string>());
@@ -280,6 +308,7 @@ export default function Game({ init }: { init: Init }) {
   const gesture = useRef<Gesture>(null);
   const dragPos = useRef<Pt | null>(null);
   const lastEmit = useRef(0);
+  const lastTap = useRef<{ id: string; t: number } | null>(null); // for double-click detection on tokens
   const chatVisible = useRef(false);
   const toastTimer = useRef<number | undefined>(undefined);
 
@@ -314,9 +343,9 @@ export default function Game({ init }: { init: Init }) {
     }
   };
 
-    const tabs: Tab[] = isGm
-    ? ["chat", "dice", "tokens", "library", "invite", "settings"]
-    : ["token", "chat", "dice", "settings"];
+  const tabs: Tab[] = isGm
+    ? ["chat", "initiative", "tokens", "library", "invite", "settings"]
+    : ["token", "chat", "initiative", "settings"];
 
   useEffect(() => {
     chatVisible.current = open && tab === "chat";
@@ -343,7 +372,10 @@ export default function Game({ init }: { init: Init }) {
     const vp = viewportRef.current;
     const v = vp ? constrain(next, vp.clientWidth, vp.clientHeight, dims.current) : next;
     view.current = v;
-    if (layerRef.current) layerRef.current.style.transform = `translate(${v.x}px, ${v.y}px) scale(${v.z})`;
+    if (layerRef.current) {
+      layerRef.current.style.transform = `translate(${v.x}px, ${v.y}px) scale(${v.z})`;
+      layerRef.current.style.setProperty("--inv", String(1 / v.z)); // ruler lines and labels keep their on-screen size
+    }
     if (zoomRef.current) zoomRef.current.textContent = `${Math.round(v.z * 100)}%`;
   }, []);
 
@@ -481,7 +513,19 @@ export default function Game({ init }: { init: Init }) {
       setThumbTick((n) => n + 1); // look for the next map without a preview
     })();
   }, [maps, isGm, thumbTick]);
-
+    // Esc: stop the ruler tool and clear the measurement
+  const rulerActive = tool !== "none" || !!ruler;
+  useEffect(() => {
+    if (!rulerActive) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setTool("none");
+        setRuler(null);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [rulerActive]);
   // ---------- live events ----------
   useEffect(() => {
     socket.on("members", setMembers);
@@ -557,6 +601,8 @@ export default function Game({ init }: { init: Init }) {
       setTier(d.tier);
     });
     socket.on("library", setLibrary);
+    socket.on("initiative", setInitiative);
+        socket.on("measure", setMeasure);
     socket.on("chatCleared", () => {
       setMessages([]);
       setUnread(0);
@@ -575,6 +621,7 @@ export default function Game({ init }: { init: Init }) {
       setShots([]);
       setShaking({});
       setTweens({});
+      setRuler(null);
       fitMap();
     });
     
@@ -626,8 +673,10 @@ export default function Game({ init }: { init: Init }) {
       socket.off("tween");
       socket.off("projectile");
       socket.off("hit");
-            socket.off("maps");
+      socket.off("maps");
       socket.off("library");
+      socket.off("initiative");
+      socket.off("measure");
       socket.off("chatCleared");
       socket.off("scene");
       socket.off("chat");
@@ -647,7 +696,26 @@ export default function Game({ init }: { init: Init }) {
     x: (p.x - view.current.x) / view.current.z,
     y: (p.y - view.current.y) / view.current.z,
   });
+    // ---------- rulers ----------
+  const tokenCenter = (t: Token): Pt => ({ x: t.x + (t.size * CELL) / 2, y: t.y + (t.size * CELL) / 2 });
 
+  // With "Snap to grid" on, ruler points go to the middle of a square
+  const snapPoint = (m: Pt): Pt => {
+    const d = dims.current;
+    const x = clamp(m.x, 0, d.w);
+    const y = clamp(m.y, 0, d.h);
+    if (!snap) return { x, y };
+    return {
+      x: clamp((Math.floor(x / CELL) + 0.5) * CELL, 0, d.w),
+      y: clamp((Math.floor(y / CELL) + 0.5) * CELL, 0, d.h),
+    };
+  };
+
+  // The token under a screen point (the ruler drawing lets pointer events through)
+  const tokenAtPoint = (cx: number, cy: number): Token | undefined => {
+    const el = document.elementFromPoint(cx, cy)?.closest("[data-token-id]") as HTMLElement | null;
+    return el ? tokens[el.dataset.tokenId ?? ""] : undefined;
+  };
   const startPinch = () => {
     const [a, b] = [...pointers.current.values()];
     const v = view.current;
@@ -661,10 +729,19 @@ export default function Game({ init }: { init: Init }) {
     };
   };
 
-  // A tap on a token you control opens its panel
+    // A click on a token you control selects it (name and action buttons).
+  // A double click or double tap opens its panel.
   const onTokenTap = (id: string) => {
-    setSelectedId(id);
-    openTab(isGm ? "tokens" : "token");
+    const now = Date.now();
+    const last = lastTap.current;
+    if (last && last.id === id && now - last.t < 400) {
+      lastTap.current = null;
+      setSelectedId(id);
+      openTab(isGm ? "tokens" : "token");
+    } else {
+      lastTap.current = { id, t: now };
+      setSelectedId(id);
+    }
   };
 
   // Drop the token: snap it to the grid (if on) and tell everyone the final spot
@@ -695,6 +772,25 @@ export default function Game({ init }: { init: Init }) {
     if (pointers.current.size === 2) {
       finishToken();
       startPinch();
+      return;
+    }
+        // A ruler tool is on: dragging draws a measurement (hold Shift to pan or move tokens as usual)
+    if (tool !== "none" && !e.shiftKey) {
+      const t = tokenAtPoint(e.clientX, e.clientY);
+      const spot = snapPoint(toMap(p));
+      if (tool === "range") {
+        // One tap: rings around a token (they follow it) or around a spot
+        setRuler(
+          t
+            ? { kind: "range", tokenId: t.id, ax: 0, ay: 0, bx: 0, by: 0 }
+            : { kind: "range", ax: spot.x, ay: spot.y, bx: spot.x, by: spot.y }
+        );
+        gesture.current = null;
+        return;
+      }
+      const a = t ? tokenCenter(t) : spot;
+      setRuler({ kind: tool, ax: a.x, ay: a.y, bx: a.x, by: a.y });
+      gesture.current = { kind: "measure", tool };
       return;
     }
 
@@ -733,7 +829,12 @@ export default function Game({ init }: { init: Init }) {
       applyView({ x: mid.x - g.mapX * z, y: mid.y - g.mapY * z, z });
       return;
     }
-
+    if (g.kind === "measure") {
+      const t = tokenAtPoint(e.clientX, e.clientY);
+      const b = t ? tokenCenter(t) : snapPoint(toMap(p));
+      setRuler((r) => (r && r.kind === g.tool ? { ...r, bx: b.x, by: b.y } : r));
+      return;
+    }
     if (!g.moved && Math.hypot(p.x - g.sx, p.y - g.sy) > TAP_SLOP) g.moved = true;
     if (!g.moved) return;
 
@@ -938,6 +1039,144 @@ export default function Game({ init }: { init: Init }) {
     if (!window.confirm("Clear the whole chat for everyone? This cannot be undone.")) return;
     socket.emit("clearChat");
   };
+    // ---------- initiative ----------
+  const startInitiative = () => {
+    if (
+      initiative.active &&
+      !window.confirm("Restart initiative? All values are cleared and the players are asked to roll again.")
+    ) {
+      return;
+    }
+    socket.emit("initiativeStart");
+  };
+
+  const endInitiative = () => {
+    if (!window.confirm("End initiative and clear the list?")) return;
+    socket.emit("initiativeEnd");
+  };
+
+  // GM: a value typed by hand (empty = no value)
+  const setInitValue = (tokenId: string, text: string, current: number | null) => {
+    const v = text.trim() === "" ? null : Number(text);
+    if (v !== null && Number.isNaN(v)) return;
+    if (v !== current) socket.emit("initiativeSet", { tokenId, value: v });
+  };
+
+  // Highest first; tokens without a value at the end
+  const initRows = [...initiative.entries]
+    .filter((e) => tokens[e.tokenId])
+    .sort(
+      (a, b) =>
+        (b.value ?? -Infinity) - (a.value ?? -Infinity) ||
+        tokens[a.tokenId].label.localeCompare(tokens[b.tokenId].label)
+    );
+  const notInList = Object.values(tokens).filter((t) => !initiative.entries.some((e) => e.tokenId === t.id));
+  // Players: their own tokens that still need a roll
+  const myPending =
+    !isGm && initiative.active
+      ? initiative.entries.filter((e) => e.value === null && tokens[e.tokenId]?.ownerId === me.id)
+      : [];
+  const showInitPopup = myPending.length > 0 && initDismissed !== initiative.startedAt;
+    // ---------- ruler drawing ----------
+  const ftPerPx = measure.ftPerSquare / CELL;
+  // A size that stays the same on screen at any zoom (--inv is 1 / zoom, set on the map layer)
+  const sc = (n: number) => `calc(${n}px * var(--inv, 1))`;
+  const labelStyle: CSSProperties = {
+    fontSize: sc(15), fontWeight: 700, fill: "#1b1b1b", stroke: "#fff", strokeWidth: sc(4),
+    paintOrder: "stroke", strokeLinejoin: "round",
+  };
+  const dot = (x: number, y: number, color: string) => (
+    <line x1={x} y1={y} x2={x + 0.01} y2={y} stroke={color} strokeLinecap="round" style={{ strokeWidth: sc(11) }} />
+  );
+
+  const rulerSvg = (() => {
+    if (!ruler) return null;
+
+    if (ruler.kind === "line") {
+      const len = Math.hypot(ruler.bx - ruler.ax, ruler.by - ruler.ay);
+      return (
+        <>
+          <line
+            x1={ruler.ax} y1={ruler.ay} x2={ruler.bx} y2={ruler.by}
+            stroke="#d4380d" strokeLinecap="round" style={{ strokeWidth: sc(3) }}
+          />
+          {dot(ruler.ax, ruler.ay, "#d4380d")}
+          {dot(ruler.bx, ruler.by, "#d4380d")}
+          <text x={(ruler.ax + ruler.bx) / 2} y={(ruler.ay + ruler.by) / 2} dy="-0.7em" textAnchor="middle" style={labelStyle}>
+            {Math.round(len * ftPerPx)} ft ({(len / CELL).toFixed(1)} sq)
+          </text>
+        </>
+      );
+    }
+
+    if (ruler.kind === "circle") {
+      const rad = Math.hypot(ruler.bx - ruler.ax, ruler.by - ruler.ay);
+      return (
+        <>
+          <circle
+            cx={ruler.ax} cy={ruler.ay} r={rad} fill="#3498db" fillOpacity={0.16}
+            stroke="#2471a3" style={{ strokeWidth: sc(2.5) }}
+          />
+          <line
+            x1={ruler.ax} y1={ruler.ay} x2={ruler.bx} y2={ruler.by}
+            stroke="#2471a3" strokeLinecap="round" style={{ strokeWidth: sc(2) }}
+          />
+          {dot(ruler.ax, ruler.ay, "#2471a3")}
+          <text x={(ruler.ax + ruler.bx) / 2} y={(ruler.ay + ruler.by) / 2} dy="-0.7em" textAnchor="middle" style={labelStyle}>
+            {Math.round(rad * ftPerPx)} ft radius
+          </text>
+        </>
+      );
+    }
+
+    // Ranges: rings around a token (measured from its edge) or around a spot
+    const t = ruler.tokenId ? tokens[ruler.tokenId] : undefined;
+    if (ruler.tokenId && !t) return null;
+    const c = t ? tokenCenter(t) : { x: ruler.ax, y: ruler.ay };
+    const base = t ? (t.size * CELL) / 2 : 0;
+    const bands = [
+      { name: "Far", ft: measure.far, color: "#e74c3c" },
+      { name: "Close", ft: measure.close, color: "#e67e22" },
+      { name: "Very close", ft: measure.veryClose, color: "#d4ac0d" },
+      { name: "Melee", ft: measure.melee, color: "#27ae60" },
+    ];
+    return (
+      <>
+        {bands.map((b) => {
+          const r = base + b.ft / ftPerPx;
+          return (
+            <g key={b.name}>
+              <circle cx={c.x} cy={c.y} r={r} fill={b.color} fillOpacity={0.12} stroke={b.color} style={{ strokeWidth: sc(2.5) }} />
+              <text x={c.x} y={c.y - r} dy="-0.45em" textAnchor="middle" style={labelStyle}>
+                {b.name} {b.ft} ft
+              </text>
+            </g>
+          );
+        })}
+      </>
+    );
+  })();
+
+  // GM: Measurement settings
+  const mVal = (k: keyof Measure) => measureDraft[k] ?? String(measure[k]);
+  const saveMeasure = () => {
+    setMeasureNote("");
+    socket.emit(
+      "setMeasure",
+      {
+        ftPerSquare: Number(mVal("ftPerSquare")), melee: Number(mVal("melee")), veryClose: Number(mVal("veryClose")),
+        close: Number(mVal("close")), far: Number(mVal("far")),
+      },
+      (r: { ok?: boolean; error?: string }) => {
+        if (r?.ok) {
+          setMeasureDraft({});
+          setMeasureNote("Saved");
+        } else {
+          setMeasureNote(r?.error ?? "Could not save");
+        }
+      }
+    );
+  };
   const hpColor = (t: Token) => {
     const pct = (t.hp ?? 0) / (t.maxHp || 1);
     return pct > 0.5 ? "#2ecc71" : pct > 0.25 ? "#f1c40f" : "#e74c3c";
@@ -1086,7 +1325,7 @@ export default function Game({ init }: { init: Init }) {
         onContextMenu={(e) => e.preventDefault()}
         style={{
           position: "absolute", inset: 0, overflow: "hidden", background: "#3a3a3a",
-          touchAction: "none", userSelect: "none", cursor: "grab",
+          touchAction: "none", userSelect: "none", cursor: tool !== "none" ? "show" : "grab",
         }}
       >
         <div
@@ -1196,11 +1435,106 @@ export default function Game({ init }: { init: Init }) {
               />
             );
           })}
+          {/* rulers (only you see them) */}
+          {rulerSvg && (
+            <svg
+              width={map.w} height={map.h}
+              style={{ position: "absolute", left: 0, top: 0, pointerEvents: "none", zIndex: 99997, overflow: "visible" }}
+            >
+              {rulerSvg}
+            </svg>
+          )}
         </div>
         {/* 3D dice are drawn over the visible area, not the whole map; clicks pass through */}
         <div id="dice-layer" style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 50 }} />
       </div>
 
+                 {/* ---------- ruler buttons and dice button ---------- */}
+      <div style={{ position: "absolute", top: 62, left: 12, zIndex: 95, display: "flex", flexDirection: "column", gap: 8 }}>
+        {RULER_BUTTONS.map((b) => {
+          const on = tool === b.id;
+          return (
+            <button
+              key={b.id}
+              title={b.label}
+              aria-label={b.label}
+              onClick={() => {
+                setMenuOpen(false);
+                setTool((cur) => (cur === b.id ? "none" : b.id));
+              }}
+              style={{
+                ...floating, width: 40, height: 40, borderRadius: "50%", padding: 0, cursor: "pointer",
+                display: "flex", alignItems: "center", justifyContent: "center",
+                border: on ? "3px solid #f1c40f" : "1px solid #bbb", background: on ? "#fff6cc" : "#fff",
+              }}
+            >
+              <img
+                src={b.src} alt="" width={22} height={22} draggable={false}
+                style={{ mixBlendMode: "multiply", pointerEvents: "none" }}
+              />
+            </button>
+          );
+        })}
+        <button
+          title="Dice"
+          aria-label="Dice"
+          onClick={() => {
+            setMenuOpen(false);
+            setDiceOpen((v) => !v);
+          }}
+          style={{
+            ...floating, width: 40, height: 40, borderRadius: "50%", padding: 0, cursor: "pointer",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            border: diceOpen ? "3px solid #f1c40f" : "1px solid #bbb", background: diceOpen ? "#fff6cc" : "#fff",
+          }}
+        >
+          <img
+            src="/assets/dice.webp" alt="" width={22} height={22} draggable={false}
+            style={{ mixBlendMode: "multiply", pointerEvents: "none" }}
+          />
+        </button>
+      </div>
+
+      {/* ---------- the dice pad (opens from the dice button) ---------- */}
+      {diceOpen && (
+        <div
+          style={{
+            ...floating, position: "absolute", top: 206, left: 62, zIndex: 96, padding: 10,
+            width: "min(340px, calc(100% - 74px))", maxHeight: "calc(100% - 218px)", overflowY: "auto",
+          }}
+        >
+          <div style={{ ...row, justifyContent: "space-between", marginBottom: 6 }}>
+            <b>Dice</b>
+            <button onClick={() => setDiceOpen(false)} aria-label="Close the dice pad">✕</button>
+          </div>
+          <ChatPanel
+            mode="dice" me={me} members={members} messages={messages} dice3d={dice3d} onDice3d={setDice3d}
+            onRoll={() => {
+              // On phones, clear the screen so the dice can be seen
+              if (narrow) {
+                setDiceOpen(false);
+                setOpen(false);
+                setMenuOpen(false);
+              }
+            }}
+          />
+        </div>
+      )}
+
+      {/* ---------- ruler tool bar: on while a tool is on or a drawing is on the map ---------- */}
+      {(tool !== "none" || ruler) && (
+        <div
+          style={{
+            ...floating, position: "absolute", top: 12, left: 62, zIndex: 100, padding: "8px 10px", fontSize: 13,
+            maxWidth: `calc(100% - ${open && !narrow ? PANEL_W + 100 : 74}px)`,
+            display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap",
+          }}
+        >
+          <span>{tool !== "none" ? TOOL_HELP[tool] : "A measurement is on the map."}</span>
+          <button onClick={() => setTool("none")} disabled={tool === "none"}>Stop</button>
+          <button onClick={() => setRuler(null)} disabled={!ruler}>Clear</button>
+        </div>
+      )}
       {/* ---------- menu button and menu ---------- */}
       <button
         onClick={() => setMenuOpen((v) => !v)}
@@ -1265,7 +1599,11 @@ export default function Game({ init }: { init: Init }) {
           </label>
           <label style={{ display: "block", fontSize: 13 }}>
             <input type="checkbox" checked={showNames} onChange={(e) => setShowNames(e.target.checked)} /> Show all names
-          </label>
+        </label>
+          <div style={{ marginTop: 10, fontWeight: 600, fontSize: 13 }}>Measure</div>
+          <div style={{ ...row, marginTop: 4 }}>
+            <button onClick={() => setRuler(null)} disabled={!ruler}>Clear</button>
+          </div>
           {isGm && (
             <div style={{ marginTop: 8 }}>
               <button onClick={() => { setMenuOpen(false); setPwOpen(true); }}>Change password</button>
@@ -1273,7 +1611,55 @@ export default function Game({ init }: { init: Init }) {
           )}
         </div>
       )}
-            {/* ---------- dice result popup ---------- */}
+            {/* ---------- players: roll initiative ---------- */}
+      {showInitPopup && (
+        <div
+          style={{
+            ...floating, position: "absolute", left: "50%", transform: "translateX(-50%)", zIndex: 135,
+            bottom: narrow && open ? "calc(58% + 12px)" : 16, width: "min(340px, calc(100% - 24px))",
+            padding: 14, border: "2px solid #f1c40f",
+          }}
+        >
+          <div style={{ fontWeight: 700, fontSize: 17 }}>Roll initiative!</div>
+          <div style={{ fontSize: 12, color: "#555", marginTop: 2 }}>
+            The GM started initiative. Roll a d{initiative.die} for your token{myPending.length > 1 ? "s" : ""}.
+          </div>
+          {myPending.map((e) => {
+            const t = tokens[e.tokenId];
+            if (!t) return null;
+            return (
+              <div key={e.tokenId} style={{ ...row, flexWrap: "nowrap", marginTop: 8 }}>
+                <span
+                  style={{
+                    width: 26, height: 26, flex: "none", border: "1px solid #bbb",
+                    borderRadius: t.image ? 4 : "50%",
+                    background: t.image ? `url(${t.image}) center / contain no-repeat` : t.color,
+                  }}
+                />
+                <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {t.label}
+                </span>
+                <button
+                  onClick={() => {
+                    socket.emit("initiativeRoll", { tokenId: e.tokenId });
+                    if (narrow) {
+                      // On phones, clear the screen so the dice can be seen
+                      setOpen(false);
+                      setMenuOpen(false);
+                    }
+                  }}
+                >
+                  Roll d{initiative.die}
+                </button>
+              </div>
+            );
+          })}
+          <div style={{ marginTop: 10, textAlign: "right" }}>
+            <button onClick={() => setInitDismissed(initiative.startedAt)}>Later</button>
+          </div>
+        </div>
+      )}
+      {/* ---------- dice result popup ---------- */}
       {rollPopup && (
         <div
           onClick={() => setRollPopup(null)}
@@ -1444,7 +1830,7 @@ export default function Game({ init }: { init: Init }) {
             maxWidth: "calc(100% - 32px)", textAlign: "center", pointerEvents: "none",
           }}
         >
-          Tap your token to open chat, dice and your stats
+          {mine ? "Double-tap your token to open chat, dice and your stats" : "Tap ☰ to open chat and dice. Your GM will give you a token."}
         </div>
       )}
 
@@ -1494,22 +1880,174 @@ export default function Game({ init }: { init: Init }) {
                 dice3d={dice3d} onDice3d={setDice3d} onClear={isGm ? clearChat : undefined}
               />    
             </div>
-            <div style={show("dice")}>
-                <ChatPanel
-                mode="dice" large={!narrow} me={me} members={members} messages={messages} dice3d={dice3d} onDice3d={setDice3d}
-                onRoll={() => {
-                  // On phones, clear the screen so the dice can be seen
-                  if (narrow) {
-                    setOpen(false);
-                    setMenuOpen(false);
-                  }
-                }}
-              />
+            
+
+                        {/* Initiative tracker */}
+            <div style={show("initiative")}>
+              <div style={{ ...row, justifyContent: "space-between" }}>
+                <b>Initiative{initiative.active ? ` (d${initiative.die})` : ""}</b>
+                <span style={{ fontSize: 12, color: initiative.active ? "#1a7f37" : "#777" }}>
+                  {initiative.active ? "Running" : "Not started"}
+                </span>
+              </div>
+
+              {isGm && (
+                <div style={{ ...row, marginTop: 8 }}>
+                  <button onClick={startInitiative}>
+                    {initiative.active ? "Restart initiative" : "Start initiative"}
+                  </button>
+                  <button onClick={endInitiative} disabled={!initiative.active}>End initiative</button>
+                </div>
+              )}
+
+              {!initiative.active && (
+                <div style={{ fontSize: 12, color: "#777", marginTop: 8 }}>
+                  {isGm
+                    ? "Start initiative to list every token on this map and ask the players to roll. Choose the dice in Settings."
+                    : "The GM has not started initiative."}
+                </div>
+              )}
+
+              {initiative.active && initRows.length === 0 && (
+                <div style={{ fontSize: 13, color: "#777", marginTop: 8 }}>No tokens in the list.</div>
+              )}
+
+              {initiative.active &&
+                initRows.map((e) => {
+                  const t = tokens[e.tokenId];
+                  const mineRow = t.ownerId === me.id;
+                  return (
+                    <div
+                      key={e.tokenId}
+                      style={{
+                        ...row, flexWrap: "nowrap", borderTop: "1px solid #eee", marginTop: 6, paddingTop: 6,
+                        background: mineRow ? "#fff9e0" : undefined,
+                      }}
+                    >
+                      <span
+                        style={{
+                          width: 26, height: 26, flex: "none", border: "1px solid #bbb",
+                          borderRadius: t.image ? 4 : "50%",
+                          background: t.image ? `url(${t.image}) center / contain no-repeat` : t.color,
+                        }}
+                      />
+                      <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {t.label}
+                        {t.hidden ? " (hidden)" : ""}
+                      </span>
+                      {isGm ? (
+                        <>
+                          <input
+                            key={`${e.tokenId}iv${e.value}`} type="number" placeholder="-"
+                            defaultValue={e.value ?? ""} style={{ width: 56 }}
+                            onBlur={(ev) => setInitValue(e.tokenId, ev.target.value, e.value)}
+                          />
+                          <button
+                            onClick={() => socket.emit("initiativeRoll", { tokenId: e.tokenId })}
+                            title={`Roll a d${initiative.die}`}
+                          >
+                            Roll
+                          </button>
+                          <button
+                            onClick={() => socket.emit("initiativeRemove", { tokenId: e.tokenId })}
+                            title="Remove from initiative"
+                          >
+                            ✕
+                          </button>
+                        </>
+                      ) : e.value !== null ? (
+                        <b style={{ minWidth: 32, textAlign: "right" }}>{e.value}</b>
+                      ) : mineRow ? (
+                        <button onClick={() => socket.emit("initiativeRoll", { tokenId: e.tokenId })}>
+                          Roll d{initiative.die}
+                        </button>
+                      ) : (
+                        <span style={{ color: "#999" }}>-</span>
+                      )}
+                    </div>
+                  );
+                })}
+
+              {isGm && initiative.active && notInList.length > 0 && (
+                <div style={{ ...row, marginTop: 14 }}>
+                  <select value={initAddId} onChange={(e) => setInitAddId(e.target.value)}>
+                    <option value="">Add a token...</option>
+                    {notInList.map((t) => (
+                      <option key={t.id} value={t.id}>
+                        {t.label}
+                        {t.hidden ? " (hidden)" : ""}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    disabled={!initAddId}
+                    onClick={() => {
+                      socket.emit("initiativeAdd", { tokenId: initAddId });
+                      setInitAddId("");
+                    }}
+                  >
+                    Add
+                  </button>
+                </div>
+              )}
             </div>
 
-            {/* Settings: empty for now, for both GM and players */}
+                        {/* Settings */}
             <div style={show("settings")}>
-              <div style={{ color: "#777", fontSize: 13 }}>Nothing here yet.</div>
+              {isGm ? (
+                <div>
+                  <div style={{ fontWeight: 600 }}>Initiative dice</div>
+                  <div style={{ fontSize: 12, color: "#777", marginTop: 2 }}>
+                    The dice rolled for initiative, by the players and by the GM.
+                  </div>
+                  <div style={{ ...row, marginTop: 6, gap: 14 }}>
+                    {[6, 10, 20].map((d) => (
+                      <label key={d} style={{ fontSize: 14 }}>
+                        <input
+                          type="radio" name="initiative-die" checked={initiative.die === d}
+                          onChange={() => socket.emit("setInitiativeDie", d)}
+                        />{" "}
+                        D{d}
+                      </label>
+                    ))}
+                  </div>
+
+                  <div style={{ fontWeight: 600, marginTop: 20 }}>Measurement</div>
+                  <div style={{ fontSize: 12, color: "#777", marginTop: 2 }}>
+                    Used by the rulers (Line, Circle, Ranges). Each range is the outer limit in feet, measured from
+                    the edge of the token. They must grow from Melee to Far.
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "auto 80px", gap: "6px 10px", marginTop: 8, alignItems: "center" }}>
+                    {(
+                      [
+                        ["ftPerSquare", "Feet per square"],
+                        ["melee", "Melee (ft)"],
+                        ["veryClose", "Very close (ft)"],
+                        ["close", "Close (ft)"],
+                        ["far", "Far (ft)"],
+                      ] as const
+                    ).map(([k, label]) => (
+                      <label key={k} style={{ display: "contents", fontSize: 14 }}>
+                        <span>{label}</span>
+                        <input
+                          type="number" min={1} value={mVal(k)}
+                          onChange={(e) => setMeasureDraft((d) => ({ ...d, [k]: e.target.value }))}
+                        />
+                      </label>
+                    ))}
+                  </div>
+                  <div style={{ ...row, marginTop: 10 }}>
+                    <button onClick={saveMeasure}>Save</button>
+                    {measureNote && (
+                      <span style={{ fontSize: 13, color: measureNote === "Saved" ? "#1a7f37" : "#c0392b" }}>
+                        {measureNote}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div style={{ color: "#777", fontSize: 13 }}>Nothing here yet.</div>
+              )}
             </div>
 
             {/* Player: own token(s) */}

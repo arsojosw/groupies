@@ -8,10 +8,9 @@ import type { Socket } from "socket.io";
 import {
   db, loadDb, save, newSession, accountFromSession, endSession,
   createGm, checkLogin, createPlayer, ensureAdmin, activeInvites, listInvites, findInvite,
-  setPassword, purgeOrphanSessions, logEvent, tierSetting, TIERS,
+  setPassword, purgeOrphanSessions, logEvent, tierSetting, TIERS, DEFAULT_MEASURE,
 } from "./store";
-import type { Account, Campaign, Msg, Role, SceneMap, Tier, Token } from "./store";
-
+import type { Account, Campaign, Measure, Msg, Role, SceneMap, Tier, Token } from "./store";
 
 const app = express();
 const httpServer = createServer(app);
@@ -184,8 +183,9 @@ function parseTo(raw: unknown, camp: Campaign): string[] | null | undefined {
   return ids.length > 0 ? ids : undefined;
 }
 
-function postMsg(camp: Campaign, acc: Account, part: Pick<Msg, "to" | "kind" | "text" | "roll">) {
-  const msg: Msg = { id: randomUUID(), ts: Date.now(), fromId: acc.id, fromName: acc.name, ...part };
+function postMsg(camp: Campaign, acc: Account, part: Pick<Msg, "to" | "kind" | "text" | "roll"> & { as?: string }) {
+  const { as, ...rest } = part;
+  const msg: Msg = { id: randomUUID(), ts: Date.now(), fromId: acc.id, fromName: as ?? acc.name, ...rest };
   camp.messages.push(msg);
   if (camp.messages.length > 200) camp.messages.splice(0, camp.messages.length - 200);
   save();
@@ -258,6 +258,31 @@ function sendMaps(camp: Campaign) {
 function broadcastScene(camp: Campaign) {
   io.to(gmRoom(camp)).emit("scene", { map: mapInfo(camp), tokens: tokensFor(camp, "gm") });
   io.to(playerRoom(camp)).emit("scene", { map: mapInfo(camp), tokens: tokensFor(camp, "player") });
+  sendInitiative(camp);
+}
+
+const measureOf = (camp: Campaign): Measure => ({ ...DEFAULT_MEASURE, ...camp.measure });
+// ---------- initiative ----------
+const initDie = (camp: Campaign) => (camp.initiativeDie === 6 || camp.initiativeDie === 10 ? camp.initiativeDie : 20);
+
+// The initiative of the open map (every map keeps its own)
+function initOf(camp: Campaign) {
+  return (camp.map.initiative ??= { active: false, startedAt: 0, entries: [] });
+}
+
+// Players do not get the entries of hidden tokens
+function initiativeFor(camp: Campaign, role: Role) {
+  const i = initOf(camp);
+  const entries =
+    role === "gm"
+      ? i.entries
+      : i.entries.filter((e) => camp.tokens[e.tokenId] && !camp.tokens[e.tokenId].hidden);
+  return { active: i.active, startedAt: i.startedAt, die: initDie(camp), entries };
+}
+
+function sendInitiative(camp: Campaign) {
+  io.to(gmRoom(camp)).emit("initiative", initiativeFor(camp, "gm"));
+  io.to(playerRoom(camp)).emit("initiative", initiativeFor(camp, "player"));
 }
 
 function sendInit(socket: Socket, acc: Account, camp: Campaign) {
@@ -269,6 +294,8 @@ function sendInit(socket: Socket, acc: Account, camp: Campaign) {
     tokens: tokensFor(camp, acc.role),
     messages: camp.messages.filter((m) => canSee(m, acc.id)).slice(-50),
     invites: acc.role === "gm" ? listInvites(camp) : undefined,
+    initiative: initiativeFor(camp, acc.role),
+    measure: measureOf(camp),
     ...(acc.role === "gm"
       ? { library: camp.library, maps: mapList(camp), activeMapId: camp.activeMapId, tier: tierInfo(camp) }
       : {}),
@@ -636,10 +663,11 @@ io.on("connection", (socket) => {
     cb({ ok: true, session: newSession(found.id) });
   });
 
-  socket.on("join", (p: { code?: string; name?: string; session?: string }, cb?: Cb) => {
+    socket.on("join", (p: { code?: string; name?: string; session?: string; playerId?: string }, cb?: Cb) => {
     if (typeof cb !== "function") return;
     if (!allow(socket, "join", 10, 60_000)) return cb({ error: "Too many attempts, wait a minute" });
-    const found = findInvite(p?.code);
+    // A full link still lets players who already joined come back; only new players need a free place
+    const found = findInvite(p?.code, true);
     if (!found) return cb({ error: "This invite link is invalid or has expired" });
     const { camp, inv } = found;
 
@@ -648,24 +676,47 @@ io.on("connection", (socket) => {
 
     if (!isActive(camp)) return cb({ error: "This table is not active right now. Please ask your GM." });
 
-    const name = String(p?.name ?? "").trim().slice(0, 20);
-    if (!name) return cb({ needName: true, campaign: camp.name });
-    if (camp.memberIds.length >= 20) return cb({ error: "This table is full" });
+    const canCreate = inv.uses < inv.maxUses && camp.memberIds.length < 20;
 
+    // Come back as a player who already joined this table (no new account, no new link use)
+    if (typeof p?.playerId === "string") {
+      const player = camp.memberIds.includes(p.playerId) ? db.accounts[p.playerId] : undefined;
+      if (!player) return cb({ error: "That name is not at this table any more" });
+      postMsg(camp, player, {
+        to: [camp.gmId], kind: "action", text: `${player.name} signed in again with an existing name`,
+      });
+      return cb({ ok: true, session: newSession(player.id) });
+    }
+
+    const name = String(p?.name ?? "").trim().slice(0, 20);
+    if (!name) {
+      // First step: tell the browser who is at this table so one of them can be picked
+      const rooms = io.sockets.adapter.rooms;
+      return cb({
+        needName: true,
+        campaign: camp.name,
+        canCreate,
+        players: camp.memberIds
+          .map((id) => db.accounts[id])
+          .filter(Boolean)
+          .map((a) => ({ id: a.id, name: a.name, online: (rooms.get(acctRoom(a.id))?.size ?? 0) > 0 })),
+      });
+    }
+    if (!canCreate) {
+      return cb({ error: "This invite link is full. Pick your name from the list, or ask your GM for a new link." });
+    }
+    if (camp.memberIds.some((id) => db.accounts[id]?.name.toLowerCase() === name.toLowerCase())) {
+      return cb({ error: "That name is already used at this table. If it is you, pick it from the list." });
+    }
+
+    // New player: no token is made, the GM creates and assigns it
     inv.uses += 1;
     const player = createPlayer(camp, name);
     (inv.usedBy ??= []).push({ id: player.id, name: player.name, ts: Date.now() });
-    const id = randomUUID();
-    const n = Object.keys(camp.tokens).length;
-    camp.tokens[id] = clean(
-      { label: name, color: COLORS[camp.memberIds.length % COLORS.length], ownerId: player.id,
-        x: 20 + (n % 10) * 30, y: 20 + (n % 10) * 30, hp: 10, maxHp: 10, z: nextZ(camp) },
-      id, camp
-    );
     save();
-    emitToken(camp, "tokenAdded", camp.tokens[id]);
     io.to(everyone(camp)).emit("members", membersOf(camp));
     io.to(gmRoom(camp)).emit("invites", listInvites(camp));
+    postMsg(camp, player, { to: [camp.gmId], kind: "action", text: `${player.name} joined the table (no token yet)` });
     cb({ ok: true, session: newSession(player.id) });
   });
 
@@ -918,6 +969,7 @@ io.on("connection", (socket) => {
     } else {
       emitToken(camp, "tokenUpdated", next);
     }
+    if (wasHidden !== !!next.hidden) sendInitiative(camp); // players gain or lose that token's entry
   });
 
   socket.on("clearTokenImage", (id: string) => {
@@ -966,8 +1018,11 @@ io.on("connection", (socket) => {
   socket.on("removeToken", (id: string) => {
     if (!isGm || !camp.tokens[id]) return;
     delete camp.tokens[id];
+    const init = initOf(camp);
+    init.entries = init.entries.filter((e) => e.tokenId !== id);
     gcAssets(camp);
     io.to(everyone(camp)).emit("tokenRemoved", id);
+    sendInitiative(camp);
   });
 
   // Players: only their own token
@@ -1064,7 +1119,111 @@ io.on("connection", (socket) => {
       text: `${src.label} use ${label} to ${dst.label}`,
     });
   });
-    // GM: clear the chat for everyone
+  
+    // ---------- initiative ----------
+  // GM: start. Every token of the open map goes into the list and the players are asked to roll.
+  socket.on("initiativeStart", () => {
+    if (!isGm) return;
+    const init = initOf(camp);
+    init.active = true;
+    init.startedAt = Date.now();
+    init.entries = Object.values(camp.tokens).map((t) => ({ tokenId: t.id, value: null }));
+    save();
+    sendInitiative(camp);
+  });
+
+  // GM: end. The list is cleared.
+  socket.on("initiativeEnd", () => {
+    if (!isGm) return;
+    const init = initOf(camp);
+    init.active = false;
+    init.entries = [];
+    save();
+    sendInitiative(camp);
+  });
+
+  // GM: type a value by hand (null = no value yet)
+  socket.on("initiativeSet", (p: { tokenId?: string; value?: number | null }) => {
+    if (!isGm || !p) return;
+    const entry = initOf(camp).entries.find((e) => e.tokenId === p.tokenId);
+    if (!entry) return;
+    if (p.value === null || p.value === undefined) {
+      entry.value = null;
+    } else {
+      const v = Math.round(Number(p.value));
+      if (!Number.isFinite(v)) return;
+      entry.value = clamp(v, -99, 999);
+    }
+    save();
+    sendInitiative(camp);
+  });
+
+  // GM: add or remove a token by hand
+  socket.on("initiativeAdd", (p: { tokenId?: string }) => {
+    const init = initOf(camp);
+    if (!isGm || !init.active || typeof p?.tokenId !== "string" || !camp.tokens[p.tokenId]) return;
+    if (init.entries.some((e) => e.tokenId === p.tokenId)) return;
+    init.entries.push({ tokenId: p.tokenId, value: null });
+    save();
+    sendInitiative(camp);
+  });
+
+  socket.on("initiativeRemove", (p: { tokenId?: string }) => {
+    if (!isGm || !p) return;
+    const init = initOf(camp);
+    init.entries = init.entries.filter((e) => e.tokenId !== p.tokenId);
+    save();
+    sendInitiative(camp);
+  });
+
+  // Roll initiative for a token. The GM can roll for any token (again too); a player once, for their own.
+  socket.on("initiativeRoll", (p: { tokenId?: string }) => {
+    if (!allow(socket, "init", 20, 10_000)) return;
+    const init = initOf(camp);
+    const t = typeof p?.tokenId === "string" ? camp.tokens[p.tokenId] : undefined;
+    const entry = t ? init.entries.find((e) => e.tokenId === t.id) : undefined;
+    if (!init.active || !t || !entry) return;
+    if (!isGm && (t.ownerId !== acc.id || t.hidden || entry.value !== null)) return;
+    const sides = initDie(camp);
+    const value = 1 + Math.floor(Math.random() * sides);
+    entry.value = value;
+    save();
+    // Shown like any dice roll (3D dice and result popup), under the token's name; secret for a hidden token
+    postMsg(camp, acc, {
+      to: t.hidden ? [camp.gmId] : null,
+      kind: "roll",
+      as: t.label,
+      roll: { formula: `initiative (d${sides})`, rolls: [value], sides, keep: [true], total: value },
+    });
+    sendInitiative(camp);
+  });
+
+  // GM: the dice used for initiative
+  socket.on("setInitiativeDie", (die: number) => {
+    if (!isGm || ![6, 10, 20].includes(die)) return;
+    camp.initiativeDie = die;
+    save();
+    sendInitiative(camp);
+  });
+
+    // GM: feet per square and the four range bands used by the rulers
+  socket.on("setMeasure", (p: Partial<Record<keyof Measure, unknown>>, cb?: Cb) => {
+    if (!isGm || !p) return;
+    const n = (v: unknown) => Math.round(Number(v));
+    const m: Measure = {
+      ftPerSquare: n(p.ftPerSquare), melee: n(p.melee), veryClose: n(p.veryClose), close: n(p.close), far: n(p.far),
+    };
+    if (!(m.ftPerSquare >= 1 && m.ftPerSquare <= 100)) return cb?.({ error: "Feet per square must be 1 to 100" });
+    if (!(m.melee >= 1 && m.melee < m.veryClose && m.veryClose < m.close && m.close < m.far && m.far <= 10000)) {
+      return cb?.({ error: "Ranges must grow: Melee, then Very close, then Close, then Far (in feet)" });
+    }
+    camp.measure = m;
+    save();
+    io.to(everyone(camp)).emit("measure", m);
+    cb?.({ ok: true });
+  });
+  
+  // GM: clear the chat for everyone
   socket.on("clearChat", () => {
     if (!isGm) return;
     camp.messages = [];

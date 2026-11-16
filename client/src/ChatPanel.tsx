@@ -6,11 +6,11 @@ import type { Me, Member, Msg, Roll } from "./types";
 
 type Props = {
   me: Me; members: Member[]; messages: Msg[];
-  mode: "chat" | "dice";
+  mode: "chat" | "dice"; // "chat": messages and log. "dice": only the dice pad (rolls are logged in the chat)
   dice3d: boolean; onDice3d: (v: boolean) => void;
   large?: boolean; // laptop screens: taller log and bigger fields
   onRoll?: () => void; // called after a roll is sent (phones use it to clear the screen)
-    onClear?: () => void; // GM only: shows a "Clear chat" button
+  onClear?: () => void; // GM only: shows a "Clear chat" button
 };
 
 const DICE = [2, 4, 6, 8, 10, 12, 20, 100];
@@ -65,8 +65,8 @@ export default function ChatPanel({ me, members, messages, mode, dice3d, onDice3
     return "whispered to you";
   };
 
-  // Newest first. The dice tab shows rolls only.
-  const shown = [...(mode === "dice" ? messages.filter((m) => m.kind === "roll") : messages)].reverse();
+  // Newest first
+  const shown = [...messages].reverse();
 
   // Bigger fields and a taller log on laptop screens
   const field: CSSProperties = large ? { fontSize: 16, padding: "10px 12px" } : {};
@@ -74,9 +74,7 @@ export default function ChatPanel({ me, members, messages, mode, dice3d, onDice3
   const dieButton: CSSProperties = large
     ? { fontSize: 14, padding: "8px 10px", minWidth: 50 }
     : { padding: "6px 8px", minWidth: 40 };
-  const logHeight = large
-    ? mode === "chat" ? "calc(100vh - 205px)" : "calc(100vh - 315px)"
-    : "min(45vh, 320px)";
+  const logHeight = large ? "calc(100vh - 205px)" : "min(45vh, 320px)";
 
   return (
     <div>
@@ -140,39 +138,40 @@ export default function ChatPanel({ me, members, messages, mode, dice3d, onDice3
         </>
       )}
 
-      <div
-        style={{
-          height: logHeight, minHeight: large ? 200 : undefined, overflowY: "auto",
-          border: "1px solid #eee", borderRadius: 6, padding: 6, marginTop: 8, fontSize: large ? 15 : 14,
-        }}
-      >
-        {shown.length === 0 && (
-          <div style={{ color: "#777" }}>{mode === "chat" ? "No messages yet." : "No rolls yet."}</div>
-        )}
-        {shown.map((m) => (
-          <div
-            key={m.id}
-            style={{ marginBottom: 6, padding: m.to ? "3px 6px" : 0, background: m.to ? "#f3ecff" : "transparent", borderRadius: 4 }}
-          >
-            <span style={{ fontSize: 11, color: "#777" }}>
-              {new Date(m.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}{" "}
-            </span>
-            {m.kind === "action" ? (
-              <>
-                <i>{m.text}</i>
-                {tag(m) && <span style={{ fontSize: 11, color: "#7b3fb5" }}> ({tag(m)})</span>}
-              </>
-            ) : (
-              <>
-                <b>{m.fromName}</b>
-                {tag(m) && <span style={{ fontSize: 11, color: "#7b3fb5" }}> ({tag(m)})</span>}
-                {": "}
-                {m.kind === "roll" && m.roll ? <RollText r={m.roll} /> : m.text}
-              </>
-            )}
-          </div>
-        ))}
-      </div>
+      {/* The message log is only in the chat. Rolls show up there too. */}
+      {mode === "chat" && (
+        <div
+          style={{
+            height: logHeight, minHeight: large ? 200 : undefined, overflowY: "auto",
+            border: "1px solid #eee", borderRadius: 6, padding: 6, marginTop: 8, fontSize: large ? 15 : 14,
+          }}
+        >
+          {shown.length === 0 && <div style={{ color: "#777" }}>No messages yet.</div>}
+          {shown.map((m) => (
+            <div
+              key={m.id}
+              style={{ marginBottom: 6, padding: m.to ? "3px 6px" : 0, background: m.to ? "#f3ecff" : "transparent", borderRadius: 4 }}
+            >
+              <span style={{ fontSize: 11, color: "#777" }}>
+                {new Date(m.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}{" "}
+              </span>
+              {m.kind === "action" ? (
+                <>
+                  <i>{m.text}</i>
+                  {tag(m) && <span style={{ fontSize: 11, color: "#7b3fb5" }}> ({tag(m)})</span>}
+                </>
+              ) : (
+                <>
+                  <b>{m.fromName}</b>
+                  {tag(m) && <span style={{ fontSize: 11, color: "#7b3fb5" }}> ({tag(m)})</span>}
+                  {": "}
+                  {m.kind === "roll" && m.roll ? <RollText r={m.roll} /> : m.text}
+                </>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
